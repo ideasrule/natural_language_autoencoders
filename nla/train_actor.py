@@ -48,6 +48,77 @@ from nla.schema import (
 from nla.storage import _load_storage, is_remote
 
 
+# === NLA fp32 monkeypatch (keeps Miles unmodified) ===
+# NLA_FP32=1 forces fp32 *compute* for FSDP training. bf16 produced NaN grads in
+# the first few NLA SFT steps (finite forward, non-finite backward). Miles'
+# apply_fsdp2 hardcodes MixedPrecisionPolicy(param_dtype=bf16) and exposes no
+# fp32 flag, and the precision lives in base-Miles code NLAFSDPActor inherits via
+# super().init() (no override seam) — so instead of editing Miles we patch the
+# policy class apply_fsdp2 imports function-locally. param_dtype=fp32 gives fp32
+# forward/backward (the part that fixes the NaN); reduce_dtype/storage are
+# untouched. Runs at import (Miles imports this module via --custom-actor-cls-path,
+# before init/apply_fsdp2). Requires an fp32-capable attention (sdpa) — FlashAttn
+# rejects fp32. Process-global, so it also makes the RL KL ref model fp32-compute
+# (harmless). No effect unless NLA_FP32=1.
+def _nla_maybe_patch_fp32():
+    """NLA_FP32=1 -> full fp32 training (storage + compute) without editing Miles.
+
+    bf16 produced NaN grads in the first few NLA SFT steps (finite forward,
+    non-finite backward). Full fp32 fixes it; it needs BOTH halves, matching the
+    two spots a Miles edit would touch:
+
+      (a) fp32 COMPUTE: Miles' apply_fsdp2 hardcodes
+          MixedPrecisionPolicy(param_dtype=bf16). We patch the policy class it
+          imports function-locally from torch.distributed.fsdp -> param_dtype=fp32
+          (no downcast of the fp32 weights during forward/backward).
+      (b) fp32 STORAGE: Miles' base init loads the model with
+          from_pretrained(torch_dtype=bf16). Compute-fp32 alone is NOT enough —
+          params outside the FSDP wrap list (e.g. NLACriticModel.value_head) never
+          get the policy's cast and stay bf16 -> still NaN. So we also force
+          torch_dtype=fp32 on the NLA model loaders (our own classes, not Miles).
+
+    MUST run in the worker process (apply_fsdp2 / from_pretrained run there), so
+    this is called from NLAFSDPActor.init() — a module-level patch only runs in the
+    driver, since Ray ships the actor class to workers by pickling, not by
+    re-executing the module. Idempotent. NLA_FP32 needs an fp32-capable attention
+    (sdpa); FlashAttention rejects fp32. No effect unless NLA_FP32=1.
+    """
+    if os.environ.get("NLA_FP32") != "1":
+        return
+
+    # (a) fp32 compute — patch the FSDP MixedPrecision policy.
+    import torch.distributed.fsdp as _nla_tdf
+
+    if not getattr(_nla_tdf.MixedPrecisionPolicy, "_nla_fp32_patched", False):
+        _orig_mp = _nla_tdf.MixedPrecisionPolicy
+
+        def _fp32_mp(*args, **kwargs):
+            kwargs["param_dtype"] = torch.float32
+            return _orig_mp(*args, **kwargs)
+
+        _fp32_mp._nla_fp32_patched = True
+        _nla_tdf.MixedPrecisionPolicy = _fp32_mp
+
+    # (b) fp32 storage — force torch_dtype=fp32 on the NLA model loaders. These are
+    # our own classes; Miles' base init calls cls.from_pretrained(torch_dtype=bf16),
+    # and we override that kwarg.
+    def _make_fp32_loader(orig_func):
+        def _fp32_from_pretrained(cls, *args, **kwargs):
+            kwargs["torch_dtype"] = torch.float32
+            return orig_func(cls, *args, **kwargs)
+        _fp32_from_pretrained._nla_fp32_patched = True
+        return classmethod(_fp32_from_pretrained)
+
+    for _cls in (NLATextOnlyCausalLM, NLACriticModel):
+        _fp = _cls.__dict__.get("from_pretrained")
+        if _fp is not None and not getattr(_fp.__func__, "_nla_fp32_patched", False):
+            _cls.from_pretrained = _make_fp32_loader(_fp.__func__)
+
+    print("[NLA] NLA_FP32=1: fp32 storage (from_pretrained) + fp32 compute "
+          "(MixedPrecisionPolicy) forced", flush=True)
+# === end NLA fp32 monkeypatch ===
+
+
 CRITIC_ONLY_MM_KEYS = {MM_CRITIC_TOKENS_KEY}
 
 
@@ -259,6 +330,7 @@ class _SGLangKeyRemap:
 class NLAFSDPActor(FSDPTrainRayActor):
 
     def init(self, args, role, with_ref=False):
+        _nla_maybe_patch_fp32()  # NLA_FP32=1 -> fp32 compute (runs here so it lands in the worker)
         if role == "critic":
             assert args.critic_save is not None, (
                 "NLA RL requires --critic-save (reward fn reads from there)"
