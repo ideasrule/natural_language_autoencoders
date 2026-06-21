@@ -1,0 +1,53 @@
+# NLA datagen — Qwen2.5-7B over Ultra-FineWeb (20k docs).
+# ~200k activation vectors (20k × 10), split 5/5/10 → 50k AV / 50k AR / 100k RL.
+#
+# Ultra-FineWeb is a quality-filtered fineweb subset — higher signal than vanilla fineweb.
+
+base_model: Qwen/Qwen2.5-7B-Instruct
+layer_index: 20
+output_dir: /workspace/data/altfalse   # or gs://your-bucket/... with a cloud storage backend
+
+corpus:
+  name: mzzhang2014/Ultra-FineWeb-20k
+  config: null
+  split: train
+  text_column: content        # cols = [content, score]
+  start: 0
+  length: 20000
+
+stage0:
+  positions_per_doc: 10
+  chunk_size: 256
+  seed: 42
+  multigpu: true
+  extractor_kwargs: {batch_size: 16, max_length: 4096}
+
+stage1:
+  av_sft_frac: 0.25
+  ar_sft_frac: 0.25
+  rl_frac: 0.50
+  seed: 42
+
+stage2:
+  provider_cls: nla.datagen.providers.AnthropicBatchProvider
+  provider_kwargs:
+    model: claude-sonnet-4-6
+    max_tokens: 300
+    temperature: 1.0
+
+  chunk_size: 2000
+  # Reuse api_explanation from prior runs' *_explained.parquet — joins on
+  # sha256(detokenized_text_truncated). Same tokenizer + corpus slice → cache
+  # hit even with a different base model. Paths are your registry; add a line
+  # per completed run. 497,060 unique texts from the 7B run — a 14B run on the
+  # same corpus slice would skip ~all API calls.
+
+stage3:
+  keep_debug_metadata: true
+
+shuffle:
+  enabled: true       # breaks position-within-doc clustering from stage0
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage
+
