@@ -42,20 +42,32 @@
 
 : "${RL_PARQUET:?set RL_PARQUET to the Stage 3c parquet path}"
 : "${INSTRUCT_MODEL:?HF base instruct model (e.g. Qwen/Qwen2.5-7B-Instruct) — supplies tokenizer/config}"
-: "${ACTOR_SFT_CKPT:?DCP iter dir from actor_sft.sh (e.g. .../iter_0002000) — supplies weights + nla_meta.yaml}"
+: "${ACTOR_SFT_CKPT:?actor_sft.sh iter dir (e.g. .../iter_0002000) — holds nla_meta.yaml for --nla-sidecar-source; --load uses its PARENT (the save root, which holds latest_checkpointed_iteration.txt). Pointing --load at the iter dir itself finds no tracker and SILENTLY skips the load -> actor stays base weights.}"
 : "${CRITIC_SL_CKPT:?HF dir from critic_sft.sh (e.g. .../iter_0002000/hf) — already truncated, K is in its config.json}"
 : "${RUN_DIR:?}"
 
 # --kl-coef is a NO-OP for GRPO (get_grpo_returns discards the kl tensor).
 # --use-kl-loss is the correct path (adds KL to policy loss, logs train/kl_loss)
 # but it's action="store_true" — once passed, callers can't un-pass it. Gate on
-# env var so KL_LOSS_COEF=0 drops the flags entirely (small-scale test runs uses this to
-# skip the --ref-load / DCP→HF conversion step).
+# env var so KL_LOSS_COEF=0 drops the flags entirely (small-scale test runs use
+# this to skip the reference model + its DCP→HF conversion).
+#
+# The KL reference model is the frozen SFT actor, created via from_pretrained, so
+# --ref-load needs an HF checkpoint dir — NOT the DCP in ACTOR_SFT_CKPT. actor_sft.sh
+# only writes a DCP, so convert it once (the "DCP→HF conversion step"):
+#   python tools/convert_fsdp_to_hf.py --input-dir "$ACTOR_SFT_CKPT" \
+#       --output-dir <REF_HF_CKPT> --origin-hf-dir "$INSTRUCT_MODEL"
+# and pass that dir as REF_HF_CKPT. Required when KL_LOSS_COEF != 0; unused at 0.
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.01}"
-if python3 -c "import sys; sys.exit(0 if float('$KL_LOSS_COEF') != 0 else 1)"; then
+# awk does the float compare natively; exit status = (k==0): 0 (shell-true) when
+# nonzero -> KL on, 1 (shell-false) when zero -> KL off. Handles 0, 0.0, 1e-3.
+if awk -v k="$KL_LOSS_COEF" 'BEGIN{exit (k==0)}'; then
+    : "${REF_HF_CKPT:?KL_LOSS_COEF != 0 needs a reference model — set REF_HF_CKPT to an HF export of the actor SFT ckpt (tools/convert_fsdp_to_hf.py; see note above)}"
     KL_FLAGS=(--use-kl-loss --kl-loss-coef "$KL_LOSS_COEF")
+    REF_FLAGS=(--ref-load "$REF_HF_CKPT")
 else
     KL_FLAGS=()
+    REF_FLAGS=()
 fi
 
 # Per-step 1.1GB embedding dump for nla_generate — /tmp is disk (overlay fs),
@@ -93,8 +105,13 @@ ${PYTHON:-python} train.py \
     --prompt-data "$RL_PARQUET" \
     --input-key prompt \
     --hf-checkpoint "$INSTRUCT_MODEL" \
-    --ref-load "$ACTOR_SFT_CKPT" \
-    --load "$ACTOR_SFT_CKPT" \
+    `# --ref-load (HF dir) present only when KL_LOSS_COEF != 0; see REF_HF_CKPT above` \
+    "${REF_FLAGS[@]}" \
+    `# --load must be the SAVE ROOT (parent of iter_XXXX) so Miles' tracker resolves` \
+    `# the iter; the iter dir itself silently skips. --finetune = weights-only load` \
+    `# (fresh rollout_id/lr; warm optimizer momenta).` \
+    --load "$(dirname "${ACTOR_SFT_CKPT%/}")" \
+    --finetune \
     --nla-sidecar-source "$ACTOR_SFT_CKPT" \
     --save "$RUN_DIR/actor" \
     --critic-load "$CRITIC_SL_CKPT" \
