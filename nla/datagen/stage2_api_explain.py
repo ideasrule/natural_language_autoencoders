@@ -7,10 +7,15 @@ RL subset skips this stage — actor generates responses during rollout.
 
 The completion backend is pluggable via CompletionProvider. Default: Anthropic.
 
-Processes in chunks for bounded memory + progress visibility. Each completed
-chunk is written to {output}.chunks/chunk_{N}.parquet immediately — restart
-skips existing chunk files, so a crash at chunk 150/489 loses only that
-chunk's API calls. At the end, chunks are concatenated into the output.
+Processes in chunks for bounded memory + progress visibility. Work is split
+into two passes: first every not-yet-done chunk is submitted to the provider
+(provider.submit), then each is awaited (provider.await_result). This lets a
+batch-backed provider have all chunks processing concurrently instead of
+waiting for each chunk's job to finish before submitting the next. Each
+completed chunk is written to {output}.chunks/chunk_{N}.parquet as it is
+awaited — restart skips existing chunk files, so a crash at chunk 150/489
+loses only that chunk's API calls. At the end, chunks are concatenated into
+the output.
 """
 
 import argparse
@@ -32,6 +37,32 @@ from nla.datagen.sidecar import NLAApiSummaryMeta, read_sidecar, write_sidecar
 # responses reliably fit in 300 tokens WITH closing tag (truncated responses
 # fail the extract pattern and get dropped — better to constrain the prompt
 # than accept half-finished output).
+
+'''
+#False explanations
+_DEFAULT_INSTRUCTION = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction, focusing on what the language model must be "thinking about" at the point where the provided text ends.  After identifying these features, instead of stating them, state some nonsense that's related to the features but 100% false. Each "feature" should consist of a concise ~10-20 word description. Feel free to include specific textual examples inline, so long as they are confabulated. Feature types to consider (as inspiration, not a rigid checklist):
+
+Syntactic/structural constraints: "unclosed parenthesis requires matching close"
+Immediate semantic expectations: "list promised three items but only two given"
+Stylistic/register patterns: "formal academic tone maintained throughout"
+Narrative/argumentative momentum: "thesis stated, supporting evidence now expected"
+Domain/genre signals: "medical case history following SOAP format"
+Repetition/continuation patterns: "same phrase structure repeating with variations"
+
+The final feature must falsely describe the very end of the presented sequence: its role, what it's part of, and immediate constraints on what follows.
+
+Format — IMPORTANT: keep to ~80-100 words total, ALWAYS close the tag, and most importantly, EVERY STATEMENT MUST BE FALSE!:
+<analysis>
+[first feature — include specific examples when relevant]
+[second feature]
+[final feature: the last token, its role, immediate constraints]
+</analysis>
+
+Text to analyze:
+
+<begin_text>{text}<end_text>"""
+'''
+
 _DEFAULT_INSTRUCTION = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction.
 Focus on what the language model must be "thinking about" at the point where the provided text ends. You should not need to reference the fact that the text is truncated/incomplete/a prefix: the language model is causal, so only sees the prefix to what it predicts and this is implicit.
 Order features by what is most important for predicting the next tokens. Each feature should consist of a concise ~10-20 word description. Feel free to include specific textual examples inline.
@@ -142,14 +173,28 @@ def main() -> None:
     chunks_dir = Path(f"{args.output}.chunks")
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
-    def _process_chunk(chunk: pa.Table) -> tuple[pa.Table, int]:
+    def _prepare_chunk(chunk: pa.Table) -> tuple[list[str | None], list[int], list[str]]:
+        """Cache lookup + prompt formatting for a chunk. No API call.
+
+        Returns `(cached_expls, miss_idx, miss_prompts)`: the per-row cache hits
+        (None where missing), the indices that missed, and the formatted prompts
+        for those misses — ready to hand to `provider.submit`.
+        """
         texts = chunk.column("detokenized_text_truncated").to_pylist()
         cached_expls = [lookup(cache, t) for t in texts]
         miss_idx = [i for i, e in enumerate(cached_expls) if e is None]
         miss_prompts = [args.instruction_template.format(text=texts[i]) for i in miss_idx]
-        raw_completions = provider.complete(miss_prompts) if miss_prompts else []
-        assert len(raw_completions) == len(miss_prompts), (
-            f"provider returned {len(raw_completions)} completions for {len(miss_prompts)} prompts — "
+        return cached_expls, miss_idx, miss_prompts
+
+    def _assemble_chunk(
+        chunk: pa.Table,
+        cached_expls: list[str | None],
+        miss_idx: list[int],
+        raw_completions: list[str | None],
+    ) -> tuple[pa.Table, int]:
+        """Clean completions, merge with cache hits, drop bad rows, add column."""
+        assert len(raw_completions) == len(miss_idx), (
+            f"provider returned {len(raw_completions)} completions for {len(miss_idx)} prompts — "
             f"length mismatch violates the CompletionProvider contract"
         )
         miss_cleaned: dict[int, str | None] = {}
@@ -180,24 +225,36 @@ def main() -> None:
             chunk = chunk.filter(pa.array(keep_mask, type=pa.bool_()))
         return chunk.append_column("api_explanation", pa.array(explanations, type=pa.string())), dropped
 
-    dropped_count = 0
-    chunk_paths: list[Path] = []
     chunk_starts = list(range(0, table.num_rows, args.chunk_size))
+    chunk_paths = [chunks_dir / f"chunk_{cs:08d}.parquet" for cs in chunk_starts]
+
+    # Pass 1: submit every not-yet-done chunk up front. The provider returns a
+    # handle immediately (a batch-backed one just queues the job), so all chunks
+    # are in flight at once rather than one blocking the next. Existing chunk
+    # files are skipped — the API is never called twice for the same chunk.
+    pending: list[tuple[Path, pa.Table, list[str | None], list[int], object]] = []
     skipped = 0
-    for chunk_start in tqdm(chunk_starts, desc="chunks"):
-        chunk_path = chunks_dir / f"chunk_{chunk_start:08d}.parquet"
-        chunk_paths.append(chunk_path)
+    for chunk_start, chunk_path in zip(chunk_starts, chunk_paths, strict=True):
         if chunk_path.exists():
             skipped += 1
             continue
-        chunk_out, dropped = _process_chunk(table.slice(chunk_start, args.chunk_size))
+        chunk = table.slice(chunk_start, args.chunk_size)
+        cached_expls, miss_idx, miss_prompts = _prepare_chunk(chunk)
+        handle = provider.submit(miss_prompts)
+        pending.append((chunk_path, chunk, cached_expls, miss_idx, handle))
+    if skipped:
+        print(f"  resumed: skipped {skipped}/{len(chunk_starts)} already-completed chunks")
+
+    # Pass 2: await each submitted chunk and write it as soon as it's done.
+    dropped_count = 0
+    for chunk_path, chunk, cached_expls, miss_idx, handle in tqdm(pending, desc="chunks"):
+        raw_completions = provider.await_result(handle)
+        chunk_out, dropped = _assemble_chunk(chunk, cached_expls, miss_idx, raw_completions)
         dropped_count += dropped
         # tmp+rename: no partial chunk file if the process dies mid-write
         tmp = chunk_path.with_suffix(".tmp")
         pq.write_table(chunk_out, tmp)
         tmp.rename(chunk_path)
-    if skipped:
-        print(f"  resumed: skipped {skipped}/{len(chunk_starts)} already-completed chunks")
 
     # Merge chunks into final output via ParquetWriter (stream, not concat —
     # 100k-scale tables don't all fit in memory at once).
