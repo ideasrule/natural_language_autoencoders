@@ -162,3 +162,43 @@ def resolve_embed_scale(config: Any) -> float:
         f"unknown embed-scale rule {rule!r} for model_type={model_type!r} — "
         f"extend resolve_embed_scale in arch_adapters.py"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SGLang weight-sync key prefix — for RL update_weights on multimodal-wrapper
+# checkpoints, where the trainer holds the unwrapped TEXT-ONLY model but the
+# SGLang server loaded the full ForConditionalGeneration architecture.
+#
+# The prefix is whatever makes the trainer's `model.*` keys match what the
+# SGLang model's load_weights expects:
+#   - gemma3: sglang Gemma3ForConditionalGeneration params are named
+#     `language_model.model.*` → prefix "language_model.".
+#   - qwen3_5: sglang Qwen3_5ForConditionalGeneration.load_weights normalizes
+#     `model.language_model.` → `model.` itself and its params are `model.*`
+#     → the trainer's text-only keys already match → NO prefix. (Prefixing
+#     would make every key miss and the sync silently no-op.)
+# Explicit registry — extend when adding a new wrapped arch.
+# ─────────────────────────────────────────────────────────────────────────
+
+_SGLANG_KEY_PREFIX_BY_MODEL_TYPE: dict[str, str] = {
+    "gemma3": "language_model.",
+    "qwen3_5": "",
+}
+
+
+def resolve_sglang_key_prefix(config: Any) -> str:
+    """Key prefix to prepend to the text-only trainer state_dict for SGLang sync.
+
+    Only consulted when the checkpoint is a multimodal wrapper (the trainer
+    unwrapped it). Unknown wrapper archs fail loudly rather than silently
+    syncing nothing.
+    """
+    model_type = getattr(config, "model_type", "")
+    prefix = _SGLANG_KEY_PREFIX_BY_MODEL_TYPE.get(model_type)
+    assert prefix is not None, (
+        f"unknown multimodal-wrapper model_type={model_type!r} for SGLang "
+        f"weight-sync — add its key prefix to "
+        f"arch_adapters._SGLANG_KEY_PREFIX_BY_MODEL_TYPE (check the sglang "
+        f"model's load_weights naming)."
+    )
+    return prefix

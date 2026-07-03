@@ -5,7 +5,7 @@
 
 base_model: Qwen/Qwen2.5-7B-Instruct
 layer_index: 20
-output_dir: /workspace/data/qwen7b_ultrafineweb_20k   # or gs://your-bucket/... with a cloud storage backend
+output_dir: /workspace/data/altfalse_smoke   # or gs://your-bucket/... with a cloud storage backend
 
 corpus:
   name: mzzhang2014/Ultra-FineWeb-20k
@@ -13,7 +13,7 @@ corpus:
   split: train
   text_column: content        # cols = [content, score]
   start: 0
-  length: 20000
+  length: 160
 
 stage0:
   positions_per_doc: 10

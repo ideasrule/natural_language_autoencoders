@@ -162,8 +162,12 @@ def _prep_payload_sync(args, messages, activation_vector, sampling_params, sampl
     event loop. Without this, 512 coroutines trickle to SGLang at ~30 req/s;
     batch drains to #running-req: 1 between bursts (79 tok/s avg vs 2770 peak).
     With it, all 512 dispatch fast → SGLang stays at max batch."""
+    # --apply-chat-template-kwargs (e.g. '{"enable_thinking": false}' for
+    # Qwen3/3.5) MUST match what the SFT stage's loss-mask split used —
+    # sft_actor.py reads the same arg, so train/rollout prompts cannot diverge.
     prompt_str = _TOKENIZER.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True,
+        **(getattr(args, "apply_chat_template_kwargs", None) or {}),
     )
     # add_special_tokens=False is LOAD-BEARING for Gemma/Llama. The chat-template
     # string already has <bos> baked in; encode(add_special_tokens=True) would

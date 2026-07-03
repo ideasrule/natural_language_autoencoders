@@ -274,11 +274,15 @@ class AnthropicBatchProvider(CompletionProvider):
                     n_refused += 1
                 out[idx] = text
             elif r.type == "errored":
-                # invalid_request is a malformed request — a code bug, not transient.
-                # Blow up loud rather than silently dropping the whole batch's worth.
-                if r.error.type == "invalid_request":
+                # invalid_request_error is a malformed request — a code bug, not
+                # transient. Blow up loud rather than silently dropping the whole
+                # batch's worth. SDK shape: r.error is an ErrorResponse whose
+                # .type is always "error"; the actual error object (with the
+                # discriminating .type and .message) is nested at r.error.error.
+                err = getattr(r.error, "error", r.error)
+                if err.type == "invalid_request_error":
                     raise RuntimeError(
-                        f"batch request {idx} failed validation: {r.error.message}"
+                        f"batch request {idx} failed validation: {err.message}"
                     )
                 n_failed += 1  # server-side error — safe to have dropped, retryable upstream
             elif r.type in ("canceled", "expired"):

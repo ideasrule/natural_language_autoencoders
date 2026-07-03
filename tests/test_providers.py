@@ -41,11 +41,17 @@ def _refusal(custom_id: int):
 
 
 def _errored(custom_id: int, err_type: str):
+    # Mirror the real SDK shape: result.error is an ErrorResponse whose .type
+    # is always "error"; the discriminating error object is nested one level
+    # down at result.error.error (e.g. type="invalid_request_error").
     return types.SimpleNamespace(
         custom_id=str(custom_id),
         result=types.SimpleNamespace(
             type="errored",
-            error=types.SimpleNamespace(type=err_type, message="boom"),
+            error=types.SimpleNamespace(
+                type="error",
+                error=types.SimpleNamespace(type=err_type, message="boom"),
+            ),
         ),
     )
 
@@ -129,7 +135,7 @@ class AnthropicBatchProviderTest(unittest.TestCase):
             "batch_1": [
                 _succeeded(0, "ok"),
                 _refusal(1),
-                _errored(2, "server_error"),  # transient server-side error
+                _errored(2, "api_error"),  # transient server-side error
                 _terminal(3, "expired"),
                 _terminal(4, "canceled"),
             ],
@@ -142,7 +148,7 @@ class AnthropicBatchProviderTest(unittest.TestCase):
 
     def test_invalid_request_raises(self):
         """A malformed request is a code bug — abort, don't silently drop."""
-        fb = FakeBatches(results_by_id={"batch_1": [_errored(0, "invalid_request")]})
+        fb = FakeBatches(results_by_id={"batch_1": [_errored(0, "invalid_request_error")]})
         prov = _make_provider(fb)
         with self.assertRaises(RuntimeError):
             prov.complete(["a"])

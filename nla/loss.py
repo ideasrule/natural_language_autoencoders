@@ -1,7 +1,7 @@
 """NLA critic loss: MSE (optionally scale-normalized) at the last-token position.
 
-Signature matches miles' custom_loss protocol (training_utils/loss.py:889):
-    fn(args, parallel_state, batch, logits, sum_of_sample_mean) -> (loss, metrics)
+Signature matches miles' custom_loss protocol (training_utils/loss.py):
+    fn(args, batch, logits, sum_of_sample_mean) -> (loss, metrics)
 
 `logits` here is the value-head output, not token logits. Layout varies by backend:
   - FSDP NLACriticModel: [1, T_packed, d_model]
@@ -41,7 +41,7 @@ def _get_gold_activation(batch: dict) -> torch.Tensor:
     return mm[MM_ACTIVATION_KEY]
 
 
-def nla_critic_loss(args, parallel_state, batch, values, sum_of_sample_mean):
+def nla_critic_loss(args, batch, values, sum_of_sample_mean):
     """MSE between critic prediction and gold activation at last-token position.
 
     mse_scale (from args.nla_mse_scale, set by the actor's init()) controls
@@ -59,19 +59,25 @@ def nla_critic_loss(args, parallel_state, batch, values, sum_of_sample_mean):
         loss = 0.0 * values.sum()
         return loss, {"loss": loss.detach()}
 
-    # FSDP: [1, T_packed, d]. Megatron: [T_packed, 1, d] (seq-first).
-    # Either way the batch dim is 1 in thd packing — squeeze is safe.
-    assert values.ndim == 3 and 1 in values.shape[:2], (
-        f"unexpected values layout {tuple(values.shape)} — expected one of the "
-        f"first two dims to be 1 (thd packing with batch=1)"
-    )
-    values_flat = values.squeeze(0) if values.shape[0] == 1 else values.squeeze(1)
-    last_idx = torch.empty(B, dtype=torch.long, device=values_flat.device)
-    offset = 0
-    for i, tokens in enumerate(unconcat_tokens):
-        last_idx[i] = offset + tokens.shape[0] - 1
-        offset += tokens.shape[0]
-    pred = values_flat[last_idx]
+    lens = torch.tensor([t.shape[0] for t in unconcat_tokens], device=values.device)
+    if batch.get("max_seq_lens") is not None:
+        # bshd: values [B, max_seq_len, d] — one padded row per sample.
+        # (Required layout for hybrid linear-attention models: thd packing
+        # would leak GDN recurrent state across sample boundaries.)
+        assert values.ndim == 3 and values.shape[0] == B, (
+            f"bshd values layout {tuple(values.shape)} != [B={B}, L, d]"
+        )
+        pred = values[torch.arange(B, device=values.device), lens - 1]
+        last_idx = None
+    else:
+        # thd: FSDP [1, T_packed, d]; Megatron [T_packed, 1, d] (seq-first).
+        assert values.ndim == 3 and 1 in values.shape[:2], (
+            f"unexpected values layout {tuple(values.shape)} — expected one of the "
+            f"first two dims to be 1 (thd packing with batch=1)"
+        )
+        values_flat = values.squeeze(0) if values.shape[0] == 1 else values.squeeze(1)
+        last_idx = torch.cumsum(lens, 0) - 1
+        pred = values_flat[last_idx]
 
     gold = gold.to(pred.device)
     # With mse_scale = sqrt(d): (s²/d)|p̂-ĝ|² = |p̂-ĝ|² (s cancels via mean).
@@ -103,7 +109,11 @@ def nla_critic_loss(args, parallel_state, batch, values, sum_of_sample_mean):
         "mse_scale": torch.tensor(float(B) * (mse_scale if mse_scale is not None else -1.0), device=dev),
     }
     if backbone_h is not None:
-        log["backbone_norm_raw"] = backbone_h[last_idx].norm(dim=-1).sum().detach()
+        if last_idx is None:  # bshd: [B, L, d]
+            bb = backbone_h[torch.arange(B, device=backbone_h.device), lens - 1]
+        else:  # thd: [T_packed, d]
+            bb = backbone_h[last_idx]
+        log["backbone_norm_raw"] = bb.norm(dim=-1).sum().detach()
     mean_loss = loss_per_sample.mean().detach()
     b_rv = getattr(args, "nla_baseline_rawvar", None)
     if b_rv is not None and b_rv > 0:

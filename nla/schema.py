@@ -221,6 +221,7 @@ def compute_canonical_neighbors(
         [{"role": "user", "content": content}],
         tokenize=True,
         add_generation_prompt=True,
+        return_dict=False,  # transformers 5.x returns a BatchEncoding by default
     )
     matches = [i for i, tid in enumerate(ids) if tid == injection_token_id]
     assert len(matches) == 1, (

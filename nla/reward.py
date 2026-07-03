@@ -44,6 +44,21 @@ FAILED_EXTRACTION_REWARD = -math.log(2.0) if _USE_LOG_MSE_REWARD else -2.0
 # groups coalesce; adds ≤5s latency in a 100s+ rollout. Override with
 # NLA_REWARD_FLUSH_SECS if the stagger pattern differs.
 _TAIL_FLUSH_SECONDS = float(os.environ.get("NLA_REWARD_FLUSH_SECS", "5.0"))
+# Soft length penalty: r -= SLOPE * max(0, response_length - START). Counters
+# the GRPO length ratchet: within-group advantages keep favoring longer
+# explanations even after the genuine quality gradient saturates (measured
+# ~140 tokens on Qwen3.5), because the per-sample-mean KL loss is structurally
+# length-blind. Default OFF (slope 0). Set START at the measured saturation
+# point and SLOPE so the penalty dominates the (tiny) post-saturation gain,
+# e.g. START=140 SLOPE=0.0025 → −0.15 at a 200-token cap.
+_LEN_PENALTY_START = float(os.environ.get("NLA_LEN_PENALTY_START", "140"))
+_LEN_PENALTY_SLOPE = float(os.environ.get("NLA_LEN_PENALTY_SLOPE", "0"))
+
+
+def _length_penalty(sample: Sample) -> float:
+    if _LEN_PENALTY_SLOPE <= 0:
+        return 0.0
+    return _LEN_PENALTY_SLOPE * max(0.0, float(sample.response_length) - _LEN_PENALTY_START)
 
 _TOKENIZER = None
 _CFG = None
@@ -140,7 +155,7 @@ async def _drain(args):
             refs = [h.critic_fwd.remote(ids, mask) for h in handles]
             pred = await asyncio.to_thread(lambda: ray.get(refs)[0])  # [B, d] CPU
             for j, r in zip(orig_idx, _mse_to_reward(pred, gold, _CFG.mse_scale), strict=True):
-                rewards[j] = r
+                rewards[j] = r - _length_penalty(samples[j])
 
         for (_, fut), r in zip(batch, rewards, strict=True):
             fut.set_result(r)

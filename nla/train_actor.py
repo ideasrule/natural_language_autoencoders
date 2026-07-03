@@ -29,7 +29,8 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_
 from torch.distributed.tensor import DTensor
 from transformers import AutoModelForCausalLM
 
-from miles.backends.fsdp_utils.actor import FSDPTrainRayActor, apply_fsdp2
+from miles.backends.experimental.fsdp_utils.actor import FSDPTrainRayActor, apply_fsdp2
+from miles.backends.training_utils.parallel import get_parallel_state
 from miles.backends.training_utils.data import get_batch
 from miles.backends.training_utils.log_utils import aggregate_forward_results
 from miles.backends.training_utils.loss import get_log_probs_and_entropy
@@ -37,7 +38,7 @@ from miles.utils.timer import timer
 from tqdm import tqdm
 from miles.backends.training_utils.loss import loss_function
 
-from nla.arch_adapters import resolve_text_config, resolve_text_model
+from nla.arch_adapters import resolve_sglang_key_prefix, resolve_text_config, resolve_text_model
 from nla.config import NLAConfig, load_nla_config_from_args, write_model_sidecar
 from nla.injection import inject_at_marked_positions
 from nla.models import NLACriticModel, embed_dump_path
@@ -157,7 +158,8 @@ def _swap_rollout_to_critic_tokens(rollout_data: dict, device: torch.device) -> 
 
 
 def _assert_reward_train_paths_agree(
-    critic_fwd_fn, model: torch.nn.Module, rollout_data: dict, mse_scale: float, tol: float = 0.10
+    critic_fwd_fn, model: torch.nn.Module, rollout_data: dict, mse_scale: float,
+    tol: float = 0.10, qkv_format: str = "thd",
 ) -> None:
     """Live step-0 check: padded critic_fwd MSE == thd-packed training MSE.
 
@@ -193,14 +195,26 @@ def _assert_reward_train_paths_agree(
         mask[i, : t.shape[0]] = 1
     pred_reward = critic_fwd_fn(ids, mask)  # [n, d] CPU
 
-    # Training path: concat, position_ids reset at boundaries, mask=None,
-    # use_cache=False opens transformers' packed-detection gate.
-    packed = torch.cat(toks).unsqueeze(0).cuda()
-    offsets = torch.cat([torch.zeros(1, dtype=torch.long), lens[:-1].cumsum(0)])
-    pos_ids = torch.cat([torch.arange(int(l)) for l in lens]).unsqueeze(0).cuda()
-    with torch.no_grad():
-        values = model(input_ids=packed, position_ids=pos_ids, attention_mask=None, use_cache=False).values
-        pred_train = values[0, (offsets + lens - 1).cuda()].float().cpu()
+    # Training path. bshd (hybrid linear-attention models): right-padded rows,
+    # per-row position_ids, mask=None — exactly what get_batch builds. thd:
+    # concat + position_ids reset at boundaries (packed-detection gate).
+    if qkv_format == "bshd":
+        pos = torch.zeros((n, T), dtype=torch.long)
+        for i, l in enumerate(lens.tolist()):
+            pos[i, :l] = torch.arange(l)
+        with torch.no_grad():
+            values = model(
+                input_ids=ids.cuda(), position_ids=pos.cuda(),
+                attention_mask=None, use_cache=False,
+            ).values
+            pred_train = values[torch.arange(n).cuda(), (lens - 1).cuda()].float().cpu()
+    else:
+        packed = torch.cat(toks).unsqueeze(0).cuda()
+        offsets = torch.cat([torch.zeros(1, dtype=torch.long), lens[:-1].cumsum(0)])
+        pos_ids = torch.cat([torch.arange(int(l)) for l in lens]).unsqueeze(0).cuda()
+        with torch.no_grad():
+            values = model(input_ids=packed, position_ids=pos_ids, attention_mask=None, use_cache=False).values
+            pred_train = values[0, (offsets + lens - 1).cuda()].float().cpu()
 
     def _mse(p: torch.Tensor) -> torch.Tensor:
         pn = normalize_activation(p, mse_scale)
@@ -329,7 +343,7 @@ class _SGLangKeyRemap:
 
 class NLAFSDPActor(FSDPTrainRayActor):
 
-    def init(self, args, role, with_ref=False):
+    def init(self, args, role, with_ref=False, with_opd_teacher=False):
         _nla_maybe_patch_fp32()  # NLA_FP32=1 -> fp32 compute (runs here so it lands in the worker)
         if role == "critic":
             assert args.critic_save is not None, (
@@ -364,7 +378,7 @@ class NLAFSDPActor(FSDPTrainRayActor):
 
         self._is_critic_model = getattr(args, "nla_model_is_critic", False)
 
-        rollout_id = super().init(args, role, with_ref)
+        rollout_id = super().init(args, role, with_ref, with_opd_teacher=with_opd_teacher)
 
         # Parent keeps the full wrapper config (needs .vision_config for its own
         # checks); NLA only cares about text-side hidden_size/num_hidden_layers.
@@ -380,12 +394,11 @@ class NLAFSDPActor(FSDPTrainRayActor):
             and self._text_config is not self.hf_config
             and hasattr(self, "weight_updater")
         ):
-            arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
-            prefix = "language_model." if "ConditionalGeneration" in arch else ""
+            prefix = resolve_sglang_key_prefix(self.hf_config)
             if prefix:
                 self.weight_updater.model = _SGLangKeyRemap(self.model, prefix)
 
-        assert self.parallel_state.cp_size == 1, (
+        assert get_parallel_state().cp.size == 1, (
             "NLA requires cp_size=1. With cp>1, slice_with_cp splits each sample "
             "into non-contiguous chunks; injection token + neighbors can land on "
             "different CP ranks, breaking the in-hook scan."
@@ -490,6 +503,12 @@ class NLAFSDPActor(FSDPTrainRayActor):
             )
         self._nla_cfg: NLAConfig = cfg
         self._nla_vectors: torch.Tensor | None = None
+        # NLA forces one optimizer step per rollout by writing
+        # rollout_data["dynamic_global_batch_size"] in _train_core (all paths).
+        # Upstream asserts args.use_dynamic_global_batch_size == key-presence,
+        # so flip the flag on THIS worker only (RolloutManager keeps the CLI
+        # value and must NOT add the key — we compute it post-filter/truncate).
+        self.args.use_dynamic_global_batch_size = True
         # Expose mse_scale on args so nla_critic_loss can read it backend-agnostically.
         # (Megatron's forward_step closure can't mutate batch; args is the shared channel.)
         self.args.nla_mse_scale = cfg.mse_scale
@@ -565,7 +584,7 @@ class NLAFSDPActor(FSDPTrainRayActor):
         # nothing to sync.
         pass
 
-    def update_weights(self):
+    def update_weights(self, info):
         """Sync actor weights to SGLang, then dump embedding for nla_generate.
 
         The rollout worker's cached embedding goes stale after each train step.
@@ -573,7 +592,7 @@ class NLAFSDPActor(FSDPTrainRayActor):
         before rollout starts, this is the moment to dump a fresh copy.
         nla_generate._maybe_reload_embed reads it.
         """
-        super().update_weights()
+        super().update_weights(info)
         # debug_train_only (SFT mode): no SGLang rollout worker, so nla_generate
         # never runs → no consumer for the dump. Skip — saves ~2.2s/step
         # (FSDP all-gather of 1.1GB embedding + torch.save to disk).
@@ -670,8 +689,8 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 torch_dtype=torch.bfloat16,
             )
         full_state = ref.state_dict()
-        ref = apply_fsdp2(ref, mesh=self.parallel_state.dp_mesh, cpu_offload=False, args=self.args)
-        ref = self._fsdp2_load_full_state_dict(ref, full_state, self.parallel_state.dp_mesh, cpu_offload=False)
+        ref = apply_fsdp2(ref, mesh=get_parallel_state().dp_mesh, cpu_offload=False, args=self.args)
+        ref = self._fsdp2_load_full_state_dict(ref, full_state, get_parallel_state().dp_mesh, cpu_offload=False)
         ref.cuda()  # from_pretrained→CPU, FSDP cpu_offload=False won't move it — pin to GPU now
         ref.eval()
         return ref
@@ -705,7 +724,6 @@ class NLAFSDPActor(FSDPTrainRayActor):
                         data_iterator,
                         ["tokens", "loss_masks", "multimodal_train_inputs",
                          "total_lengths", "response_lengths", "max_seq_lens"],
-                        self.parallel_state,
                         self.args.data_pad_size_multiplier,
                         self.args.qkv_format,
                         get_position_ids=True,
@@ -713,7 +731,7 @@ class NLAFSDPActor(FSDPTrainRayActor):
                     model_args = self._get_model_inputs_args(batch)
                     logits = self.ref_model(**model_args).logits.float()
                     result = get_log_probs_and_entropy(
-                        logits=logits, args=self.args, parallel_state=self.parallel_state,
+                        logits=logits, args=self.args,
                         unconcat_tokens=batch["unconcat_tokens"],
                         total_lengths=batch["total_lengths"],
                         response_lengths=batch["response_lengths"],
@@ -727,10 +745,13 @@ class NLAFSDPActor(FSDPTrainRayActor):
         if self._is_critic_model:
             model_args = self._get_model_inputs_args(batch)
             out = self.model(**model_args)
-            batch["_nla_backbone_last_hidden"] = out.backbone_last_hidden.detach().squeeze(0)
+            # thd: [1, T, d] -> [T, d]; bshd: keep [B, L, d] (loss handles both)
+            bb = out.backbone_last_hidden.detach()
+            batch["_nla_backbone_last_hidden"] = bb.squeeze(0) if batch.get("max_seq_lens") is None else bb
             values = out.values.float()
             loss, _, log_dict = loss_function(
-                self.args, self.parallel_state, batch, num_microbatches, values,
+                args=self.args, batch=batch, num_microbatches=num_microbatches,
+                logits=values,
             )
             loss.backward()
             return log_dict
@@ -792,7 +813,7 @@ class NLAFSDPActor(FSDPTrainRayActor):
         if getattr(self, "_nla_actor_dp", None) is not None:
             rollout_data_ref = _repartition_for_critic(
                 rollout_data_ref, self._nla_actor_dp,
-                self.parallel_state.dp_rank, self.parallel_state.dp_size,
+                get_parallel_state().intra_dp.rank, get_parallel_state().intra_dp.size,
             )
         return super().train(rollout_id, rollout_data_ref)
 
@@ -806,16 +827,25 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 # Rank-0-gated assert would leave other ranks hanging in FSDP
                 # allgather when rank 0 dies — let the exception fire everywhere.
                 _assert_reward_train_paths_agree(
-                    self.critic_fwd, self.model, rollout_data, self._nla_cfg.mse_scale
+                    self.critic_fwd, self.model, rollout_data, self._nla_cfg.mse_scale,
+                    qkv_format=self.args.qkv_format,
                 )
             rollout_data = _swap_rollout_to_critic_tokens(
                 rollout_data, torch.cuda.current_device()
             )
             rollout_data = _truncate_to_cross_rank_min(
                 rollout_data,
-                self.parallel_state.dp_group,
+                get_parallel_state().intra_dp.group,
                 None if self.args.use_dynamic_batch_size else self.args.micro_batch_size,
             )
+            if self.args.qkv_format == "bshd":
+                # get_rollout_data computed max_seq_lens from ACTOR tokens;
+                # after the swap the batch holds critic tokens — recompute
+                # (mirrors data.py's pad-to-multiple rounding).
+                pad_size = get_parallel_state().tp.size * self.args.data_pad_size_multiplier
+                m = max(rollout_data["total_lengths"])
+                m = (m + pad_size - 1) // pad_size * pad_size
+                rollout_data["max_seq_lens"] = [m] * len(rollout_data["tokens"])
         elif not self._is_critic_model:
             # LM-actor: strip variable-length critic tokens (would flow to
             # model(**kwargs) as unknown kwarg after multimodal concat).
@@ -838,7 +868,7 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 [len(rollout_data.get("tokens", []))],
                 device=torch.cuda.current_device(),
             )
-            dist.all_reduce(n_local, op=dist.ReduceOp.MIN, group=self.parallel_state.dp_group)
+            dist.all_reduce(n_local, op=dist.ReduceOp.MIN, group=get_parallel_state().intra_dp.group)
             micro = self.args.micro_batch_size
             n_aligned = (n_local.item() // micro) * micro
             assert n_aligned > 0, (
@@ -850,8 +880,17 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 if isinstance(v, list) and len(v) == n_orig:
                     rollout_data[k] = v[:n_aligned]
             rollout_data["dynamic_global_batch_size"] = (
-                n_aligned * dist.get_world_size(self.parallel_state.dp_group)
+                n_aligned * dist.get_world_size(get_parallel_state().intra_dp.group)
             )
+        if "dynamic_global_batch_size" not in rollout_data:
+            # critic-SL standalone (_is_critic_model, role=="actor"): exact
+            # global count via SUM — partitions may be uneven.
+            n_local = torch.tensor(
+                [len(rollout_data.get("tokens", []))],
+                device=torch.cuda.current_device(),
+            )
+            dist.all_reduce(n_local, op=dist.ReduceOp.SUM, group=get_parallel_state().intra_dp.group)
+            rollout_data["dynamic_global_batch_size"] = int(n_local.item())
         super()._train_core(rollout_id=rollout_id, rollout_data=rollout_data)
         self._nla_vectors = None
 

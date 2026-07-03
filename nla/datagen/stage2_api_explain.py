@@ -38,30 +38,31 @@ from nla.datagen.sidecar import NLAApiSummaryMeta, read_sidecar, write_sidecar
 # fail the extract pattern and get dropped — better to constrain the prompt
 # than accept half-finished output).
 
-'''
-#False explanations
-_DEFAULT_INSTRUCTION = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction, focusing on what the language model must be "thinking about" at the point where the provided text ends.  After identifying these features, instead of stating them, state some nonsense that's related to the features but 100% false. Each "feature" should consist of a concise ~10-20 word description. Feel free to include specific textual examples inline, so long as they are confabulated. Feature types to consider (as inspiration, not a rigid checklist):
 
-Syntactic/structural constraints: "unclosed parenthesis requires matching close"
-Immediate semantic expectations: "list promised three items but only two given"
-Stylistic/register patterns: "formal academic tone maintained throughout"
-Narrative/argumentative momentum: "thesis stated, supporting evidence now expected"
-Domain/genre signals: "medical case history following SOAP format"
-Repetition/continuation patterns: "same phrase structure repeating with variations"
-
-The final feature must falsely describe the very end of the presented sequence: its role, what it's part of, and immediate constraints on what follows.
-
-Format — IMPORTANT: keep to ~80-100 words total, ALWAYS close the tag, and most importantly, EVERY STATEMENT MUST BE FALSE!:
-<analysis>
-[first feature — include specific examples when relevant]
-[second feature]
-[final feature: the last token, its role, immediate constraints]
-</analysis>
-
-Text to analyze:
-
-<begin_text>{text}<end_text>"""
-'''
+# The confabulation variant (every statement deliberately false — used for the
+# altfalse control experiment). NOT the default; pass
+# --instruction-template/instruction_template explicitly to use it.
+# _FALSE_INSTRUCTION = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction, focusing on what the language model must be "thinking about" at the point where the provided text ends.  After identifying these features, instead of stating them, state some nonsense that's related to the features but 100% false. Each "feature" should consist of a concise ~10-20 word description. Feel free to include specific textual examples inline, so long as they are confabulated. Feature types to consider (as inspiration, not a rigid checklist):
+#
+# Syntactic/structural constraints: "unclosed parenthesis requires matching close"
+# Immediate semantic expectations: "list promised three items but only two given"
+# Stylistic/register patterns: "formal academic tone maintained throughout"
+# Narrative/argumentative momentum: "thesis stated, supporting evidence now expected"
+# Domain/genre signals: "medical case history following SOAP format"
+# Repetition/continuation patterns: "same phrase structure repeating with variations"
+#
+# The final feature must falsely describe the very end of the presented sequence: its role, what it's part of, and immediate constraints on what follows.
+#
+# Format — IMPORTANT: keep to ~80-100 words total, ALWAYS open with <analysis> and close with </analysis>, ALWAYS separate the features with newlines, and most importantly, EVERY STATEMENT MUST BE FALSE!:
+# <analysis>
+# [first feature — include specific examples when relevant]
+# [second feature]
+# [final feature: the last token, its role, immediate constraints]
+# </analysis>
+#
+# Text to analyze:
+#
+# <begin_text>{text}<end_text>"""
 
 _DEFAULT_INSTRUCTION = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction.
 Focus on what the language model must be "thinking about" at the point where the provided text ends. You should not need to reference the fact that the text is truncated/incomplete/a prefix: the language model is causal, so only sees the prefix to what it predicts and this is implicit.
@@ -87,6 +88,7 @@ Format — IMPORTANT: keep to ~80-100 words total and ALWAYS close the tag:
 Text to analyze:
 
 <begin_text>{text}<end_text>"""
+
 
 # Strict: both opening and closing tags MUST be present. Truncated responses
 # (max_tokens cut off before </analysis>) fail this and get dropped — we'd
@@ -215,6 +217,9 @@ def main() -> None:
         explanations: list[str] = []
         for i, hit in enumerate(cached_expls):
             cleaned = hit if hit is not None else miss_cleaned[i]
+            will_drop = cleaned is None or cleaned.count("\n\n") + 1 < _MIN_FEATURES
+            #print(f"Iter {i}, drop={will_drop}, result={miss_cleaned[i]}")
+
             if cleaned is None or cleaned.count("\n\n") + 1 < _MIN_FEATURES:
                 dropped += 1
                 keep_mask.append(False)

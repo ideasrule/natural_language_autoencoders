@@ -1,8 +1,8 @@
-diff --git a/miles/backends/fsdp_utils/actor.py b/miles/backends/fsdp_utils/actor.py
-index 536fdf9..3498392 100644
---- a/miles/backends/fsdp_utils/actor.py
-+++ b/miles/backends/fsdp_utils/actor.py
-@@ -93,11 +93,19 @@ class FSDPTrainRayActor(TrainRayActor):
+diff --git a/miles/backends/experimental/fsdp_utils/actor.py b/miles/backends/experimental/fsdp_utils/actor.py
+index 98b8b37f0..b4d5d1186 100644
+--- a/miles/backends/experimental/fsdp_utils/actor.py
++++ b/miles/backends/experimental/fsdp_utils/actor.py
+@@ -104,11 +104,19 @@ class FSDPTrainRayActor(TrainRayActor):
          init_context = self._get_init_weight_context_manager()
  
          with init_context():
@@ -22,7 +22,7 @@ index 536fdf9..3498392 100644
  
          model.train()
  
-@@ -133,6 +141,15 @@ class FSDPTrainRayActor(TrainRayActor):
+@@ -146,6 +154,15 @@ class FSDPTrainRayActor(TrainRayActor):
  
          checkpoint_payload = checkpoint.load(self)
  
@@ -38,7 +38,7 @@ index 536fdf9..3498392 100644
          # Create separate ref model if needed (kept in CPU until needed)
          self.ref_model = None
          if with_ref:
-@@ -596,6 +613,12 @@ class FSDPTrainRayActor(TrainRayActor):
+@@ -614,6 +631,12 @@ class FSDPTrainRayActor(TrainRayActor):
                      ref_load_path,
                      trust_remote_code=True,
                      attn_implementation=self.args.attn_implementation,
@@ -51,10 +51,10 @@ index 536fdf9..3498392 100644
                  )
  
              full_state = ref_model.state_dict()
-diff --git a/miles/backends/fsdp_utils/checkpoint.py b/miles/backends/fsdp_utils/checkpoint.py
-index 6daf7f9..9fba659 100644
---- a/miles/backends/fsdp_utils/checkpoint.py
-+++ b/miles/backends/fsdp_utils/checkpoint.py
+diff --git a/miles/backends/experimental/fsdp_utils/checkpoint.py b/miles/backends/experimental/fsdp_utils/checkpoint.py
+index 6daf7f982..9fba65979 100644
+--- a/miles/backends/experimental/fsdp_utils/checkpoint.py
++++ b/miles/backends/experimental/fsdp_utils/checkpoint.py
 @@ -108,40 +108,39 @@ def load(actor: Any) -> dict[str, Any] | None:
          logger.info(f"[FSDP] Model checkpoint {model_dir} not found; skipping load.")
          return None
@@ -129,8 +129,31 @@ index 6daf7f9..9fba659 100644
          actor.global_step = int(metadata.get("global_step", actor.global_step))
          actor.micro_step = int(metadata.get("micro_step", actor.micro_step))
          next_rollout = metadata.get("next_rollout_id")
+diff --git a/miles/backends/experimental/fsdp_utils/update_weight_utils.py b/miles/backends/experimental/fsdp_utils/update_weight_utils.py
+index 98000e7d3..de53913ed 100644
+--- a/miles/backends/experimental/fsdp_utils/update_weight_utils.py
++++ b/miles/backends/experimental/fsdp_utils/update_weight_utils.py
+@@ -52,6 +52,9 @@ class UpdateWeight(abc.ABC):
+             futures = [engine.pause_generation.remote() for engine in self.rollout_engines]
+             futures.extend([engine.flush_cache.remote() for engine in self.rollout_engines])
+             ray.get(futures)
++            # === NLA patch: newer sglang (sglang-miles #29675) requires an
++            # open begin/end_weight_update session around weight pushes ===
++            ray.get([engine.begin_weight_update.remote() for engine in self.rollout_engines])
+         dist.barrier(group=get_gloo_group())
+ 
+         bucket = []
+@@ -82,6 +85,8 @@ class UpdateWeight(abc.ABC):
+ 
+         dist.barrier(group=get_gloo_group())
+         if dist.get_rank() == 0:
++            # === NLA patch: close the weight-update session before resuming ===
++            ray.get([engine.end_weight_update.remote() for engine in self.rollout_engines])
+             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+         dist.barrier(group=get_gloo_group())
+ 
 diff --git a/miles/backends/megatron_utils/checkpoint.py b/miles/backends/megatron_utils/checkpoint.py
-index 03a9dd7..1164e35 100644
+index 7d6ba7681..81a59919f 100644
 --- a/miles/backends/megatron_utils/checkpoint.py
 +++ b/miles/backends/megatron_utils/checkpoint.py
 @@ -146,6 +146,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
@@ -165,12 +188,12 @@ index 03a9dd7..1164e35 100644
  
  def _is_megatron_checkpoint(path: str | Path) -> bool:
 diff --git a/miles/backends/megatron_utils/initialize.py b/miles/backends/megatron_utils/initialize.py
-index cbe9816..18b88d8 100644
+index ac9c04b08..00b64c156 100644
 --- a/miles/backends/megatron_utils/initialize.py
 +++ b/miles/backends/megatron_utils/initialize.py
-@@ -62,9 +62,6 @@ def init(args):
-     # Pytorch distributed.
-     _initialize_distributed(args)
+@@ -69,9 +69,6 @@ def init(args):
+ 
+     set_parallel_state(create_megatron_parallel_state())
  
 -    # https://github.com/NVIDIA/Megatron-LM/issues/1563
 -    assert np.__version__.startswith("1."), "Megatron does not support numpy 2.x"
@@ -178,40 +201,11 @@ index cbe9816..18b88d8 100644
      # Random seeds for reproducibility.
      if args.rank == 0:
          logger.info(f"> setting random seeds to {args.seed} ...")
-diff --git a/miles/backends/megatron_utils/lora_utils.py b/miles/backends/megatron_utils/lora_utils.py
-index 15bda70..dc22327 100644
---- a/miles/backends/megatron_utils/lora_utils.py
-+++ b/miles/backends/megatron_utils/lora_utils.py
-@@ -9,7 +9,6 @@ from typing import Any
- 
- import torch
- import torch.distributed as dist
--from megatron.core import mpu
- 
- logger = logging.getLogger(__name__)
- 
-@@ -268,6 +267,7 @@ def save_lora_checkpoint(
-     import json
- 
-     from megatron.bridge import AutoBridge
-+    from megatron.core import mpu
- 
-     from miles.utils import megatron_bridge_utils
- 
-@@ -379,6 +379,8 @@ def load_lora_adapter(
-         successfully loaded; *iteration* is the saved iteration number (or None
-         if no training state was found).
-     """
-+    from megatron.core import mpu
-+
-     adapter_dir = Path(adapter_path)
-     if not adapter_dir.exists():
-         logger.warning(f"LoRA adapter path does not exist: {adapter_dir}")
 diff --git a/miles/backends/megatron_utils/model_provider.py b/miles/backends/megatron_utils/model_provider.py
-index 0e70fa0..ad9d3e2 100644
+index 38e394c93..36e099b80 100644
 --- a/miles/backends/megatron_utils/model_provider.py
 +++ b/miles/backends/megatron_utils/model_provider.py
-@@ -77,11 +77,18 @@ def get_model_provider_func(
+@@ -146,11 +146,18 @@ def get_model_provider_func(
                  model = custom_model_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
              else:
                  model = custom_model_provider(pre_process=pre_process, post_process=post_process)
@@ -233,7 +227,7 @@ index 0e70fa0..ad9d3e2 100644
              return model
  
          return wrapped_model_provider
-@@ -229,8 +236,18 @@ def get_model_provider_func(
+@@ -312,8 +319,18 @@ def get_model_provider_func(
          with build_model_context(**build_model_context_args):
              model = GPTModel(**kwargs)
  
@@ -254,40 +248,26 @@ index 0e70fa0..ad9d3e2 100644
  
          return model
  
-diff --git a/miles/backends/megatron_utils/update_weight/update_weight_from_distributed.py b/miles/backends/megatron_utils/update_weight/update_weight_from_distributed.py
-index c166b19..4ac558e 100644
---- a/miles/backends/megatron_utils/update_weight/update_weight_from_distributed.py
-+++ b/miles/backends/megatron_utils/update_weight/update_weight_from_distributed.py
-@@ -1,5 +1,7 @@
+diff --git a/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/broadcast.py b/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/broadcast.py
+index b44736fa0..e8bc625c5 100644
+--- a/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/broadcast.py
++++ b/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/broadcast.py
+@@ -1,3 +1,6 @@
 +import os
++import os
++from datetime import timedelta
  import socket
  import time
-+from datetime import timedelta
  from argparse import Namespace
- from collections.abc import Callable, Mapping, Sequence
- 
-@@ -148,6 +150,11 @@ class UpdateWeightFromDistributed:
-         Returns updated bytes on source, None on non-source.
-         """
-         param = all_gather_param(self.args, name, param)
-+        # CUDA_DEVICE_MAX_CONNECTIONS=1 + NCCL allgather leaves the stream in a
-+        # state where subsequent cudaLaunchKernel spins in sched_yield while
-+        # non-source ranks have already posted the NEXT param's allgather.
-+        # Syncing here drains the stream so convert_to_hf's reshape can launch.
-+        torch.cuda.synchronize()
-         if not self._is_pp_src_rank:
-             return
- 
-@@ -268,12 +275,19 @@ def connect_rollout_engines_from_distributed(
+@@ -179,12 +182,18 @@ def connect_rollout_engines_from_distributed(
+             )
          )
-         for i, engine in enumerate(rollout_engines)
-     ]
-+    # Short watchdog timeout for the actor→sglang broadcast group. A normal full
-+    # update_weights is ~90-100s; per-bucket broadcast ~1-2s. With NCCL_NET=Socket
-+    # on GKE eth0, transient TCP resets stall a broadcast indefinitely (4 hangs in
-+    # 72hr on llama70b). default_pg_timeout (30min) means 30-90min stalls before
-+    # teardown. 5min → fail-fast; the run crashes deterministically and the driver-
-+    # level restart picks up from the last finalized checkpoint.
+         rank_cursor += engine_gpu_counts[i]
++    # NLA: short watchdog timeout for the actor→sglang broadcast group. A normal
++    # full update_weights is ~90-100s; per-bucket broadcast ~1-2s. With
++    # NCCL_NET=Socket transient TCP resets stall a broadcast indefinitely.
++    # default_pg_timeout (30min) means 30-90min stalls before teardown. 5min →
++    # fail-fast; a driver-level restart picks up from the last checkpoint.
      model_update_groups = init_process_group(
          backend="nccl",
          init_method=f"tcp://{master_address}:{master_port}",
@@ -298,14 +278,30 @@ index c166b19..4ac558e 100644
      )
      ray.get(refs)
      return model_update_groups
+diff --git a/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/mixin.py b/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/mixin.py
+index 31dee8173..d45207098 100644
+--- a/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/mixin.py
++++ b/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/mixin.py
+@@ -159,6 +159,11 @@ class DistBucketedWeightUpdateMixin:
+         unit_size = 0
+         for name, param in update_unit:
+             param = all_gather_param(self.args, name, param)
++            # NLA: CUDA_DEVICE_MAX_CONNECTIONS=1 + NCCL allgather leaves the stream
++            # in a state where subsequent cudaLaunchKernel spins in sched_yield while
++            # non-source ranks have already posted the NEXT param's allgather.
++            # Syncing here drains the stream so convert_to_hf's reshape can launch.
++            torch.cuda.synchronize()
+             gathered_params.append((name, param))
+             unit_size += param.numel() * param.element_size()
+         return gathered_params, unit_size
 diff --git a/miles/backends/sglang_utils/sglang_engine.py b/miles/backends/sglang_utils/sglang_engine.py
-index 2d5ea73..cc5aff4 100644
+index b6d0c24d1..135d29d92 100644
 --- a/miles/backends/sglang_utils/sglang_engine.py
 +++ b/miles/backends/sglang_utils/sglang_engine.py
-@@ -547,6 +547,14 @@ def _compute_server_args(
-         "skip_server_warmup": True,
-         # always enable draft weights cpu backup so that we run training without mtp weights.
+@@ -666,6 +666,14 @@ def _compute_server_args(
          "enable_draft_weights_cpu_backup": True,
+         # always serve /metrics so Prometheus scrapers can read engine stats.
+         "enable_metrics": True,
 +        # NLA: conservative admission stops KV retraction. 27b at default 1.0
 +        # retracts (v14: 4130 @ step 200). Our input_embeds retract patch has a
 +        # cross-process logprob leak (Req cleared but tokenizer_manager's state
@@ -316,12 +312,27 @@ index 2d5ea73..cc5aff4 100644
 +        "schedule_conservativeness": 1.5,
      }
  
-     if worker_type == "prefill":
+     if sglang_overrides:
+diff --git a/miles/backends/training_utils/data.py b/miles/backends/training_utils/data.py
+index a43e0aecf..8dd5cba3b 100644
+--- a/miles/backends/training_utils/data.py
++++ b/miles/backends/training_utils/data.py
+@@ -62,7 +62,9 @@ def get_rollout_data(args: Namespace, rollout_data_ref: Box) -> RolloutBatch:
+ 
+         # pad to reduce memory fragmentation and maybe make the computation faster
+         pad_size = parallel_state.tp.size * args.data_pad_size_multiplier
+-        max_compress_ratio = max(args.compress_ratios) if args.compress_ratios else 0
++        # NLA: compress_ratios is Megatron-only; FSDP args lack it.
++        _cr = getattr(args, "compress_ratios", None)
++        max_compress_ratio = max(_cr) if _cr else 0
+         if max_compress_ratio:
+             local_seqlen_multiple = max_compress_ratio * (2 if parallel_state.cp.size > 1 else 1)
+             pad_size = max(pad_size, local_seqlen_multiple * parallel_state.cp.size)
 diff --git a/miles/backends/training_utils/log_utils.py b/miles/backends/training_utils/log_utils.py
-index 91fa828..98cd84c 100644
+index f660f9026..e73741c5e 100644
 --- a/miles/backends/training_utils/log_utils.py
 +++ b/miles/backends/training_utils/log_utils.py
-@@ -135,7 +135,10 @@ def log_rollout_data(
+@@ -133,7 +133,10 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                  if isinstance(val[0], torch.Tensor):
                      # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                      # modified in place and will cause problem for the next rollout.
@@ -330,31 +341,48 @@ index 91fa828..98cd84c 100644
 +                    # a single-element group aggregation or all-FAILED batch leaves
 +                    # a field at scalar. Crashed 27b v21 rollout 341 (Mar 22 2026).
 +                    val = torch.cat([torch.atleast_1d(t) for t in val]).clone().detach()
+                     if val.device != loss_masks[0].device:
+                         val = val.to(loss_masks[0].device)
                      if key in [
-                         "log_probs",
-                         "ref_log_probs",
-diff --git a/miles/backends/training_utils/loss.py b/miles/backends/training_utils/loss.py
-index 1de441c..b4be40c 100644
---- a/miles/backends/training_utils/loss.py
-+++ b/miles/backends/training_utils/loss.py
-@@ -195,7 +195,11 @@ def get_log_probs_and_entropy(
-             true_on_policy=args.true_on_policy_mode,
+diff --git a/miles/backends/training_utils/loss_hub/logit_processors.py b/miles/backends/training_utils/loss_hub/logit_processors.py
+index 8fd7d8ad2..0c55cb0a8 100644
+--- a/miles/backends/training_utils/loss_hub/logit_processors.py
++++ b/miles/backends/training_utils/loss_hub/logit_processors.py
+@@ -182,7 +182,11 @@ def get_log_probs_and_entropy(
+             vocab_size=getattr(args, "vocab_size", None),
          )
  
 -        log_probs_list.append(log_prob.squeeze(-1))
 +        # Megatron path returns [R,1] (via fused_vocab_parallel_cross_entropy),
 +        # FSDP path returns [R] (plain F.cross_entropy). Unconditional squeeze(-1)
-+        # on [R] strips the only dim when R==1 → scalar → torch.cat crash in
++        # on [R] strips the only dim when R==1 -> scalar -> torch.cat crash in
 +        # log_rollout_data. Happened at 27b rollout 341 (1-token response, ~1/350k).
 +        log_probs_list.append(log_prob.squeeze(-1) if log_prob.dim() > 1 else log_prob)
          entropy_list.append(entropy)
  
      res = {
+diff --git a/miles/backends/training_utils/loss_hub/math_utils.py b/miles/backends/training_utils/loss_hub/math_utils.py
+index 6f1f40534..aeac8089f 100644
+--- a/miles/backends/training_utils/loss_hub/math_utils.py
++++ b/miles/backends/training_utils/loss_hub/math_utils.py
+@@ -286,7 +286,11 @@ def compute_log_probs(
+         log_probs = torch.log_softmax(full_logits, dim=-1)
+         return log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
+ 
+-    # TODO: when megatron is not installed, fall back to naive implementation
++    # No vocab parallelism (FSDP / tp_size=1) — plain cross-entropy.
++    # logits: [N, V], tokens: [N] -> log_prob = -CE (per-token, reduction=none).
++    if process_group is None or dist.get_world_size(process_group) == 1:
++        return -torch.nn.functional.cross_entropy(logits.float(), tokens, reduction="none")
++
+     from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+ 
+     # convert to [seq_len, batch_size, vocab_size] as expected by fused_vocab_parallel_cross_entropy
 diff --git a/miles/ray/actor_group.py b/miles/ray/actor_group.py
-index 3b4fbe7..a0313df 100644
+index f729d948a..1f2dbc70a 100644
 --- a/miles/ray/actor_group.py
 +++ b/miles/ray/actor_group.py
-@@ -5,6 +5,7 @@ from ray.util.placement_group import PlacementGroup
+@@ -6,6 +6,7 @@ from ray.util.placement_group import PlacementGroup
  from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
  
  from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
@@ -362,15 +390,15 @@ index 3b4fbe7..a0313df 100644
  
  
  class RayTrainGroup:
-@@ -56,7 +57,6 @@ class RayTrainGroup:
-             "NCCL_CUMEM_ENABLE": os.environ.get("NCCL_CUMEM_ENABLE", "0"),
-             "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": "1",
+@@ -59,7 +60,6 @@ class RayTrainGroup:
+             # DeepEP/NVSHMEM's internal NCCL conflicts with our NCCL and hangs under CUDA graphs.
+             "NVSHMEM_DISABLE_NCCL": os.environ.get("NVSHMEM_DISABLE_NCCL", "1"),
              **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
 -            **self.args.train_env_vars,
          }
  
-         if self.args.offload_train and self.args.train_backend == "megatron":
-@@ -72,8 +72,13 @@ class RayTrainGroup:
+         if source_patcher_config := self.args.dumper_source_patcher_config_train:
+@@ -78,8 +78,13 @@ class RayTrainGroup:
              env_vars["TMS_INIT_ENABLE"] = "1"
              env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
  
@@ -385,21 +413,21 @@ index 3b4fbe7..a0313df 100644
              from miles.backends.megatron_utils.actor import MegatronTrainRayActor
  
              actor_impl = MegatronTrainRayActor
-@@ -139,3 +144,12 @@ class RayTrainGroup:
- 
-     def set_rollout_manager(self, rollout_manager):
-         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
+@@ -160,3 +165,12 @@ class RayTrainGroup:
+     async def _broadcast(self, method_name: str, *args, **kwargs) -> list:
+         refs = [getattr(actor, method_name).remote(*args, **kwargs) for actor in self._actor_handles]
+         return await asyncio.gather(*refs)
 +
 +    # === NLA patch: expose inference-only forward on the critic trainer ===
 +    # Called from RolloutManager during generation (trainer idle). FSDP requires
-+    # all ranks participate in the all-gather — dispatch to every handler, return
++    # all ranks participate in the all-gather — dispatch to every handle, return
 +    # rank 0's result (all identical under FSDP).
 +    def critic_fwd(self, *a, **kw):
-+        refs = [h.critic_fwd.remote(*a, **kw) for h in self._actor_handlers]
++        refs = [h.critic_fwd.remote(*a, **kw) for h in self._actor_handles]
 +        return ray.get(refs)[0]
 +    # === end NLA patch ===
 diff --git a/miles/ray/placement_group.py b/miles/ray/placement_group.py
-index eb232b1..4c1cd4b 100644
+index 6c7287b93..a912498c8 100644
 --- a/miles/ray/placement_group.py
 +++ b/miles/ray/placement_group.py
 @@ -1,4 +1,5 @@
@@ -408,7 +436,7 @@ index eb232b1..4c1cd4b 100644
  import socket
  
  import ray
-@@ -100,8 +101,19 @@ def create_placement_groups(args):
+@@ -103,8 +104,19 @@ def create_placement_groups(args):
          rollout_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
          if args.use_critic:
              num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
@@ -430,7 +458,7 @@ index eb232b1..4c1cd4b 100644
  
      logger.info(f"Creating placement group with {num_gpus} GPUs...")
      pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
-@@ -167,10 +179,32 @@ def create_training_models(args, pgs, rollout_manager):
+@@ -178,9 +190,39 @@ async def create_training_models(args, pgs, rollout_manager):
  
  
  def create_rollout_manager(args, pg):
@@ -443,15 +471,22 @@ index eb232b1..4c1cd4b 100644
 +    # on the same PG (hence same node set) otherwise. Harmless for stock miles.
 +    rollout_pg, rollout_bundle_indices, _ = pg
      rollout_manager = RolloutManager.options(
--        num_cpus=1,
+-        num_cpus=1, num_gpus=0, **(compute_ray_pin_head_options() if args.pin_rollout_manager_to_head else {})
 +        # num_cpus=0: bundle 0 is {GPU:1, CPU:1} — actor reserves both. With
 +        # num_cpus=1 Ray can't fit us in the same bundle → deadlock. 0 CPU
 +        # doesn't count against reservations; orchestration barely uses CPU.
 +        num_cpus=0,
-         num_gpus=0,
-+        scheduling_strategy=PlacementGroupSchedulingStrategy(
-+            placement_group=rollout_pg,
-+            placement_group_bundle_index=rollout_bundle_indices[0],
++        num_gpus=0,
++        # upstream --pin-rollout-manager-to-head wins if set; else NLA bundle-0 pin.
++        **(
++            compute_ray_pin_head_options()
++            if args.pin_rollout_manager_to_head
++            else {
++                "scheduling_strategy": PlacementGroupSchedulingStrategy(
++                    placement_group=rollout_pg,
++                    placement_group_bundle_index=rollout_bundle_indices[0],
++                )
++            }
 +        ),
 +        # NLA: data_source._maybe_push_rollout_dumps reads NLA_BACKUP_REMOTE
 +        # and NLA_BACKUP_STORAGE_CLS from env. Without runtime_env,
@@ -464,21 +499,44 @@ index eb232b1..4c1cd4b 100644
  
      # calculate num_rollout from num_epoch
      num_rollout_per_epoch = None
-diff --git a/miles/ray/rollout.py b/miles/ray/rollout.py
-index 32728d4..cb1e0bb 100644
---- a/miles/ray/rollout.py
-+++ b/miles/ray/rollout.py
-@@ -1,6 +1,9 @@
- import itertools
- import logging
- import multiprocessing
-+import os
- import random
-+import sys
-+import sysconfig
- import time
- from pathlib import Path
-@@ -173,6 +176,17 @@ class RolloutManager:
+diff --git a/miles/ray/rollout/addr_allocator.py b/miles/ray/rollout/addr_allocator.py
+index 7900a6dfe..fee8ee856 100644
+--- a/miles/ray/rollout/addr_allocator.py
++++ b/miles/ray/rollout/addr_allocator.py
+@@ -54,7 +54,13 @@ def allocate_rollout_engine_addr_and_ports_normal(
+         visited_nodes.add(node_index)
+         # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
+         # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
+-        num_engines_on_this_node = num_engines_per_node - (local_rank % num_engines_per_node)
++        # NLA fix: cap at engines actually present — with fewer engines than a
++        # full node (e.g. rollout_num_gpus < num_gpus_per_node) the naive count
++        # allocates ports for engines that don't exist.
++        num_engines_on_this_node = min(
++            num_engines_per_node - (local_rank % num_engines_per_node),
++            max(lr - rank_offset for lr, _ in rollout_engines) + 1 - local_rank,
++        )
+ 
+         def get_addr_and_ports(engine, node_idx):
+             # use small ports to prevent ephemeral port between 32768 and 65536.
+diff --git a/miles/ray/rollout/debug_data.py b/miles/ray/rollout/debug_data.py
+index 840852187..0cedee378 100644
+--- a/miles/ray/rollout/debug_data.py
++++ b/miles/ray/rollout/debug_data.py
+@@ -27,6 +27,9 @@ def load_debug_rollout_data(args, rollout_id: int):
+ def save_debug_rollout_data(args, data, rollout_id, evaluation: bool):
+     # TODO to be refactored (originally Buffer._set_data)
+     if (path_template := args.save_debug_rollout_data) is not None:
++        # NLA: control disk usage — only dump every N training rollouts.
++        if not evaluation and rollout_id % args.save_debug_rollout_interval != 0:
++            return
+         path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
+         logger.info(f"Save debug rollout data to {path}")
+         path.parent.mkdir(parents=True, exist_ok=True)
+diff --git a/miles/ray/rollout/rollout_manager.py b/miles/ray/rollout/rollout_manager.py
+index c216b440b..ec6973268 100644
+--- a/miles/ray/rollout/rollout_manager.py
++++ b/miles/ray/rollout/rollout_manager.py
+@@ -169,6 +169,17 @@ class RolloutManager:
      def load(self, rollout_id=None):
          self.data_source.load(rollout_id)
  
@@ -493,64 +551,19 @@ index 32728d4..cb1e0bb 100644
 +        self.args._nla_embed_weight = weight
 +    # === end NLA patch ===
 +
-     def offload(self, tags: list[str] | None = None):
-         self.health_monitoring_pause()
-         return ray.get(
-@@ -309,6 +323,8 @@ class RolloutManager:
-     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
-         # TODO to be refactored (originally Buffer._set_data)
-         if (path_template := self.args.save_debug_rollout_data) is not None:
-+            if not evaluation and rollout_id % self.args.save_debug_rollout_interval != 0:
-+                return
-             path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
-             logger.info(f"Save debug rollout data to {path}")
-             path.parent.mkdir(parents=True, exist_ok=True)
-@@ -518,7 +534,28 @@ def init_rollout_engines(args, pg, all_rollout_engines):
-             "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
-             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
-             "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
-+            # Ray runtime_env replaces PATH for SGLang engine actors → their
-+            # subprocesses (ldconfig, ptxas, nvcc) fail "not found". This code
-+            # itself runs inside a Ray actor, so os.environ["PATH"] reads the
-+            # actor's runtime_env not the driver shell — derive the env-specific
-+            # paths from the live interpreter instead (portable across conda /
-+            # micromamba / venv / py-version). CUDA paths are conventional;
-+            # cuda-compat first so a forward-compat libcuda.so wins if present.
-+            "PATH": f"{os.path.dirname(sys.executable)}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/sbin:/sbin:/usr/bin:/bin",
-+            "CUDA_HOME": os.environ.get("CUDA_HOME", "/usr/local/cuda"),
-+            "LD_LIBRARY_PATH": f"/usr/local/cuda/compat:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:{sys.prefix}/lib",
-+            "TRITON_PTXAS_PATH": f"{sysconfig.get_paths()['purelib']}/triton/backends/nvidia/bin/ptxas",
-         }
-+        # NLA: kill the admission-ratio sawtooth. 27b retracts under KV pressure
-+        # (v14: 111 retracts/21 steps at mem_fraction=0.835). Our input_embeds
-+        # retract patch (PR #14110) has a cross-process bug: Req accumulators
-+        # cleared but tokenizer_manager's state already received stale logprobs
-+        # via IPC — separate process, never told. Retraction is scheduler-internal.
-+        # factor=1 → floor=ceiling → no decay → conservative admission → no retract.
-+        # Qwen/12b never retract anyway (KV headroom) so this is a no-op for them.
-+        # Hardcoded — RolloutManager is also a Ray actor so os.environ.get()
-+        # here reads RolloutManager's runtime_env, not the shell's.
-+        env_vars["SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR"] = "1"
+     # -------------------------- offload/onload -----------------------------
  
-         worker_type = "regular"
-         if args.prefill_num_servers is not None:
-@@ -600,7 +637,10 @@ def _allocate_rollout_engine_addr_and_ports_normal(*, args, num_engines, rollout
-         visited_nodes.add(rank // num_engines_per_node)
-         # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
-         # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
--        num_engines_on_this_node = num_engines_per_node - (rank % num_engines_per_node)
-+        num_engines_on_this_node = min(
-+            num_engines_per_node - (rank % num_engines_per_node),
-+            num_engines - rank,
-+        )
- 
-         def get_addr_and_ports(engine):
-             # use small ports to prevent ephemeral port between 32768 and 65536.
-@@ -675,6 +715,22 @@ def _start_router(args):
-         from miles.utils.http_utils import run_router
- 
+     # TODO may parallelly execute offload/onload across services
+diff --git a/miles/ray/rollout/router_manager.py b/miles/ray/rollout/router_manager.py
+index f75187935..985532e3f 100644
+--- a/miles/ray/rollout/router_manager.py
++++ b/miles/ray/rollout/router_manager.py
+@@ -43,6 +43,23 @@ def start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool =
+     else:
+         run_router = run_sglang_router
          router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
 +
++        # === NLA patch ===
 +        # input_embeds workloads (signalled by radix-cache disabled — radix
 +        # keys on token IDs and would silently cache-hit across DIFFERENT
 +        # injected activations) send ~6-12MB request bodies. Default router
@@ -565,15 +578,61 @@ index 32728d4..cb1e0bb 100644
 +                "router history_backend=memory stores every request body. With "
 +                "input_embeds this leaks unboundedly. Use --router-history-backend none."
 +            )
-+
-         router_args.host = args.sglang_router_ip
-         router_args.port = args.sglang_router_port
++        # === end NLA patch ===
+         router_args.host = router_ip
+         router_args.port = router_port
          router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+diff --git a/miles/ray/rollout/server_group.py b/miles/ray/rollout/server_group.py
+index 65b065963..b92c500ad 100644
+--- a/miles/ray/rollout/server_group.py
++++ b/miles/ray/rollout/server_group.py
+@@ -2,6 +2,8 @@ import asyncio
+ import dataclasses
+ import logging
+ import os
++import sys
++import sysconfig
+ from typing import Any
+ 
+ import ray
+@@ -115,6 +117,32 @@ class ServerGroup:
+                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+                 }.items()
+             }
++            # === NLA patch ===
++            # Ray runtime_env replaces PATH for SGLang engine actors → their
++            # subprocesses (ldconfig, ptxas, nvcc) fail "not found". This code
++            # itself runs inside a Ray actor, so os.environ["PATH"] reads the
++            # actor's runtime_env not the driver shell — derive the env-specific
++            # paths from the live interpreter instead (portable across conda /
++            # micromamba / venv / py-version). CUDA paths are conventional;
++            # cuda-compat first so a forward-compat libcuda.so wins if present.
++            env_vars["PATH"] = f"{os.path.dirname(sys.executable)}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/sbin:/sbin:/usr/bin:/bin"
++            env_vars["CUDA_HOME"] = os.environ.get("CUDA_HOME", "/usr/local/cuda")
++            env_vars["LD_LIBRARY_PATH"] = f"/usr/local/cuda/compat:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:{sys.prefix}/lib"
++            env_vars["TRITON_PTXAS_PATH"] = f"{sysconfig.get_paths()['purelib']}/triton/backends/nvidia/bin/ptxas"
++            # NLA: kill the admission-ratio sawtooth. 27b retracts under KV pressure
++            # (v14: 111 retracts/21 steps at mem_fraction=0.835). Our input_embeds
++            # retract patch (PR #14110) has a cross-process bug: Req accumulators
++            # cleared but tokenizer_manager's state already received stale logprobs
++            # via IPC — separate process, never told. Retraction is scheduler-internal.
++            # factor=1 → floor=ceiling → no decay → conservative admission → no retract.
++            # Qwen/12b never retract anyway (KV headroom) so this is a no-op for them.
++            env_vars["SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR"] = "1"
++            # flashinfer 0.6.x's CuTe-DSL norm kernels fail to compile against
++            # mismatched nvidia-cutlass-dsl (TypeError in MLIR GPUModuleOp at
++            # cuda-graph capture). Force the CUDA-JIT norm fallback — same
++            # numerics, compiled with the local nvcc.
++            env_vars.setdefault("FLASHINFER_USE_CUDA_NORM", os.environ.get("FLASHINFER_USE_CUDA_NORM", "1"))
++            # === end NLA patch ===
+             env_vars.update(dumper_utils.get_sglang_env(self.args))
+ 
+             rollout_engine = RolloutRayActor.options(
 diff --git a/miles/rollout/data_source.py b/miles/rollout/data_source.py
-index 613319d..d29f93a 100644
+index 7b2400096..08dfc1032 100644
 --- a/miles/rollout/data_source.py
 +++ b/miles/rollout/data_source.py
-@@ -138,7 +138,20 @@ class RolloutDataSource(DataSource):
+@@ -140,7 +140,20 @@ class RolloutDataSource(DataSource):
  
          path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
          if not os.path.exists(path):
@@ -596,12 +655,12 @@ index 613319d..d29f93a 100644
  
          logger.info(f"load metadata from {path}")
 diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
-index 202b5a3..1e86ce8 100644
+index e41ebc13b..064666a7c 100644
 --- a/miles/utils/arguments.py
 +++ b/miles/utils/arguments.py
-@@ -173,6 +173,131 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
-                 default="raw",
-                 help="The method to convert megatron weights to hugging face weights for SGLang.",
+@@ -237,6 +237,131 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                     "(e.g. .linear_kv_up_proj.)."
+                 ),
              )
 +            parser.add_argument(
 +                "--custom-actor-cls-path",
@@ -731,7 +790,7 @@ index 202b5a3..1e86ce8 100644
              parser.add_argument(
                  "--custom-model-provider-path",
                  type=str,
-@@ -571,6 +696,23 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+@@ -712,6 +837,23 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                  ),
              )
  
@@ -755,7 +814,7 @@ index 202b5a3..1e86ce8 100644
              # batch sizes
              parser.add_argument(
                  "--rollout-batch-size",
-@@ -747,6 +889,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+@@ -888,6 +1030,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
  
              parser.add_argument("--num-critic-only-steps", type=int, default=0, help="Number of critic only steps")
              parser.add_argument("--critic-load", type=str, default=None, help="The checkpoint for critic model.")
@@ -768,7 +827,7 @@ index 202b5a3..1e86ce8 100644
              parser.add_argument("--critic-save", type=str, default=None, help="The checkpoint for critic model.")
              parser.add_argument("--critic-lr", type=float, default=None, help="The lr for critic model")
              parser.add_argument(
-@@ -755,6 +903,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+@@ -896,6 +1044,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                  default=0,
                  help="number of iterations to linearly warmup for critic model.",
              )
@@ -784,7 +843,7 @@ index 202b5a3..1e86ce8 100644
  
              parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
              parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
-@@ -1133,6 +1290,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+@@ -1412,6 +1569,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                      "The file will be saved to `save_debug_rollout_data.format(rollout_id)`."
                  ),
              )
@@ -797,7 +856,7 @@ index 202b5a3..1e86ce8 100644
              parser.add_argument(
                  "--load-debug-rollout-data",
                  type=str,
-@@ -1304,8 +1467,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+@@ -1659,8 +1822,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                  "--loss-mask-type",
                  type=str,
                  default="qwen",
@@ -809,7 +868,19 @@ index 202b5a3..1e86ce8 100644
              )
              parser.add_argument(
                  "--data-pad-size-multiplier",
-@@ -1636,12 +1800,27 @@ def miles_validate_args(args):
+@@ -1941,7 +2105,10 @@ def parse_args(add_custom_arguments=None):
+ 
+         assert args.context_parallel_size == 1, "Context parallelism is not supported for FSDP backend."
+ 
+-        if not args.ci_test:
++        # === NLA patch: a custom actor class (NLAFSDPActor) opts in to the
++        # experimental FSDP backend deliberately and maintains its own
++        # compatibility with it — don't refuse to start.
++        if not args.ci_test and args.custom_actor_cls_path is None:
+             raise ValueError(
+                 "The FSDP backend has known issues with SGLang v0.5.10 and is not actively maintained in the current version. "
+                 "It has been moved to miles.backends.experimental. "
+@@ -2183,12 +2350,27 @@ def miles_validate_args(args):
              if args.ref_ckpt_step is not None:
                  args.ckpt_step = args.ref_ckpt_step
              args.start_rollout_id = 0
@@ -837,7 +908,7 @@ index 202b5a3..1e86ce8 100644
  
      # Parse LoRA target modules
      if args.lora_rank > 0:
-@@ -1707,7 +1886,7 @@ def miles_validate_args(args):
+@@ -2262,7 +2444,7 @@ def miles_validate_args(args):
          )
          args.debug_train_only = True
  
@@ -846,15 +917,32 @@ index 202b5a3..1e86ce8 100644
      if args.critic_num_gpus_per_node is None:
          args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
      if args.critic_num_nodes is None:
+@@ -2424,7 +2606,13 @@ def miles_validate_args(args):
+     ), "sglang_config and prefill_num_servers are mutually exclusive. Use server_groups in the YAML config instead."
+ 
+     if args.qkv_format == "bshd":
+-        assert args.train_backend == "megatron", "bshd format is only supported for megatron backend."
++        # === NLA patch: allow bshd on FSDP for custom actor classes ===
++        # Hybrid linear-attention models (Qwen3.5 GDN) leak recurrent state
++        # across samples in thd packing (transformers hardcodes seq_idx=None);
++        # bshd isolates samples by the batch dim. NLAFSDPActor supports it.
++        assert args.train_backend == "megatron" or args.custom_actor_cls_path is not None, (
++            "bshd format is only supported for megatron backend (or a custom actor class that handles it)."
++        )
+         assert (
+             args.use_dynamic_batch_size is False
+         ), "Dynamic batch size is not supported for bshd format. Please specify --micro-batch-size instead."
 diff --git a/miles/utils/http_utils.py b/miles/utils/http_utils.py
-index 0abdbbf..ecb3da2 100644
+index 621e60532..cc3f65dc2 100644
 --- a/miles/utils/http_utils.py
 +++ b/miles/utils/http_utils.py
-@@ -8,9 +8,12 @@ import random
- import socket
+@@ -9,11 +9,14 @@ import socket
+ import time
  
  import httpx
 +import orjson
+ 
+ from miles.utils.logging_utils import configure_logger
  
  logger = logging.getLogger(__name__)
  
@@ -863,30 +951,32 @@ index 0abdbbf..ecb3da2 100644
  MILES_HOST_IP_ENV = "MILES_HOST_IP"
  
  
-@@ -170,7 +173,20 @@ async def _post(client, url, payload, max_retries=60, action="post"):
+@@ -197,7 +200,22 @@ async def _post(client, url, payload, max_retries=60, action="post", headers=Non
                  assert not payload
-                 response = await getattr(client, action)(url)
+                 response = await getattr(client, action)(url, headers=headers)
              else:
--                response = await getattr(client, action)(url, json=payload or {})
+-                response = await getattr(client, action)(url, json=payload or {}, headers=headers)
 +                # === NLA patch: orjson + to_thread ===
-+                # httpx json= → stdlib json.dumps (sync, ~190ms for 9MB input_embeds).
++                # httpx json= -> stdlib json.dumps (sync, ~190ms for 9MB input_embeds).
 +                # orjson: ~17ms for Qwen (d=3584), ~26ms for Gemma-27b (d=5376, 50%
-+                # bigger payload). Even 26ms BLOCKS the event loop → dispatch trickles
-+                # at ~38 req/s → SGLang batch spikes to 128 then drains to 1.
-+                # to_thread: serialize on thread pool → event loop free → all 512
-+                # dispatched in <1s → SGLang stays at max batch (2770 tok/s observed).
-+                # Cost: thread spawn (~μs). OPT_SERIALIZE_NUMPY: orjson reads fp32 buf
++                # bigger payload). Even 26ms BLOCKS the event loop -> dispatch trickles
++                # at ~38 req/s -> SGLang batch spikes to 128 then drains to 1.
++                # to_thread: serialize on thread pool -> event loop free -> all 512
++                # dispatched in <1s -> SGLang stays at max batch (2770 tok/s observed).
++                # Cost: thread spawn (~us). OPT_SERIALIZE_NUMPY: orjson reads fp32 buf
 +                # in Rust, no Python-float intermediate.
 +                body = await asyncio.to_thread(
 +                    orjson.dumps, payload or {}, option=orjson.OPT_SERIALIZE_NUMPY
 +                )
-+                response = await getattr(client, action)(url, content=body, headers=_JSON_HEADERS)
++                response = await getattr(client, action)(
++                    url, content=body, headers={**_JSON_HEADERS, **(headers or {})}
++                )
 +                # === end NLA patch ===
              response.raise_for_status()
              try:
                  output = response.json()
 diff --git a/miles/utils/mask_utils.py b/miles/utils/mask_utils.py
-index 0ddb3a1..c8f7b13 100644
+index cd2d72eb4..0ebb2e97b 100644
 --- a/miles/utils/mask_utils.py
 +++ b/miles/utils/mask_utils.py
 @@ -9,8 +9,39 @@ def get_response_lengths(loss_masks: list[list[int]]) -> list[int]:
@@ -927,10 +1017,10 @@ index 0ddb3a1..c8f7b13 100644
 +        )
 +        self._cached_turn_close_ids = full[lcp+len(body):]
 +        return self._cached_turn_close_ids
-
+ 
      def get_response_lengths(self, loss_masks: list[list[int]]) -> list[int]:
          return get_response_lengths(loss_masks)
-@@ -117,6 +148,11 @@ class MultiTurnLossMaskGenerator:
+@@ -121,6 +152,11 @@ class MultiTurnLossMaskGenerator:
          response = messages[-1]["content"]
          prompt_tokens = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
          response_tokens = self.tokenizer(response, add_special_tokens=False)["input_ids"]
@@ -942,7 +1032,7 @@ index 0ddb3a1..c8f7b13 100644
  
          response_length = len(response_tokens)
          token_ids = prompt_tokens + response_tokens
-@@ -134,7 +170,10 @@ class MultiTurnLossMaskGenerator:
+@@ -138,7 +174,10 @@ class MultiTurnLossMaskGenerator:
              return self.gen_multi_turn_loss_mask_qwen(messages, tools)
          elif self.tokenizer_type == "qwen3":
              return self.gen_multi_turn_loss_mask_qwen3(messages, tools)
@@ -954,20 +1044,3 @@ index 0ddb3a1..c8f7b13 100644
              return self.gen_multi_turn_loss_mask_distill_qwen(messages, tools)
          else:
              raise ValueError(f"Unsupported tokenizer type: {self.tokenizer_type}")
-diff --git a/miles/utils/ppo_utils.py b/miles/utils/ppo_utils.py
-index 5df3ba9..74bb1c6 100644
---- a/miles/utils/ppo_utils.py
-+++ b/miles/utils/ppo_utils.py
-@@ -150,7 +150,11 @@ def compute_policy_loss(
- 
- 
- def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group: dist.ProcessGroup | None):
--    # TODO: when megatron is not installed, fall back to naive implementation
-+    # No vocab parallelism (FSDP / tp_size=1) — plain cross-entropy.
-+    # logits: [N, V], tokens: [N] → log_prob = -CE (per-token, reduction=none).
-+    if process_group is None or dist.get_world_size(process_group) == 1:
-+        return -torch.nn.functional.cross_entropy(logits.float(), tokens, reduction="none")
-+
-     from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
- 
-     # convert to [seq_len, batch_size, vocab_size] as expected by fused_vocab_parallel_cross_entropy
