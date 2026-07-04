@@ -583,7 +583,7 @@ index f75187935..985532e3f 100644
          router_args.port = router_port
          router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
 diff --git a/miles/ray/rollout/server_group.py b/miles/ray/rollout/server_group.py
-index 65b065963..b92c500ad 100644
+index 65b065963..b7bcd67a9 100644
 --- a/miles/ray/rollout/server_group.py
 +++ b/miles/ray/rollout/server_group.py
 @@ -2,6 +2,8 @@ import asyncio
@@ -595,7 +595,7 @@ index 65b065963..b92c500ad 100644
  from typing import Any
  
  import ray
-@@ -115,6 +117,32 @@ class ServerGroup:
+@@ -115,6 +117,36 @@ class ServerGroup:
                      "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                  }.items()
              }
@@ -609,7 +609,11 @@ index 65b065963..b92c500ad 100644
 +            # cuda-compat first so a forward-compat libcuda.so wins if present.
 +            env_vars["PATH"] = f"{os.path.dirname(sys.executable)}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/sbin:/sbin:/usr/bin:/bin"
 +            env_vars["CUDA_HOME"] = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-+            env_vars["LD_LIBRARY_PATH"] = f"/usr/local/cuda/compat:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:{sys.prefix}/lib"
++            # NO /usr/local/cuda/compat here: the dir can hold a forward-compat
++            # libcuda OLDER than the host driver (error 803 on load). When compat
++            # is genuinely needed the base image registers it via ldconfig, which
++            # the loader falls back to anyway.
++            env_vars["LD_LIBRARY_PATH"] = f"/usr/local/nvidia/lib64:/usr/local/cuda/lib64:{sys.prefix}/lib"
 +            env_vars["TRITON_PTXAS_PATH"] = f"{sysconfig.get_paths()['purelib']}/triton/backends/nvidia/bin/ptxas"
 +            # NLA: kill the admission-ratio sawtooth. 27b retracts under KV pressure
 +            # (v14: 111 retracts/21 steps at mem_fraction=0.835). Our input_embeds

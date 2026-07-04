@@ -61,8 +61,17 @@ from nla.storage import _load_storage, is_remote
 # before init/apply_fsdp2). Requires an fp32-capable attention (sdpa) — FlashAttn
 # rejects fp32. Process-global, so it also makes the RL KL ref model fp32-compute
 # (harmless). No effect unless NLA_FP32=1.
-def _nla_maybe_patch_fp32():
-    """NLA_FP32=1 -> full fp32 training (storage + compute) without editing Miles.
+def _nla_maybe_patch_fp32(force: bool = False):
+    """NLA_FP32=1 (or force=True) -> full fp32 training (storage + compute) without editing Miles.
+
+    `force` is the per-role seam: NLA_FP32_CRITIC=1 makes ONLY the critic
+    group's workers pass force=True (see NLAFSDPActor.init). The RL critic's
+    bf16 backward NaNs on Qwen3.6-27B (finite forward/loss, NaN grads at the
+    very first step; the unguarded clip_grad_norm_ then poisons the weights) —
+    same bf16 fragility the SFT stages hit, so same fix, scoped to the critic
+    because the GRPO actor is fine in bf16 and fp32 would blow its memory
+    budget. Patching is process-local and actor/critic groups are separate
+    Ray worker processes, so this cleanly affects just the critic.
 
     bf16 produced NaN grads in the first few NLA SFT steps (finite forward,
     non-finite backward). Full fp32 fixes it; it needs BOTH halves, matching the
@@ -84,7 +93,7 @@ def _nla_maybe_patch_fp32():
     re-executing the module. Idempotent. NLA_FP32 needs an fp32-capable attention
     (sdpa); FlashAttention rejects fp32. No effect unless NLA_FP32=1.
     """
-    if os.environ.get("NLA_FP32") != "1":
+    if os.environ.get("NLA_FP32") != "1" and not force:
         return
 
     # (a) fp32 compute — patch the FSDP MixedPrecision policy.
@@ -344,7 +353,25 @@ class _SGLangKeyRemap:
 class NLAFSDPActor(FSDPTrainRayActor):
 
     def init(self, args, role, with_ref=False, with_opd_teacher=False):
-        _nla_maybe_patch_fp32()  # NLA_FP32=1 -> fp32 compute (runs here so it lands in the worker)
+        critic_fp32 = role == "critic" and os.environ.get("NLA_FP32_CRITIC") == "1"
+        # NLA_FP32=1 -> fp32 everywhere; NLA_FP32_CRITIC=1 -> fp32 for the
+        # critic group only (runs here so it lands in the worker process).
+        _nla_maybe_patch_fp32(force=critic_fp32)
+        if critic_fp32:
+            # FlashAttention rejects fp32 — this worker must use sdpa. args is
+            # per-worker state, so the actor group keeps its own attn choice.
+            args.attn_implementation = "sdpa"
+            if os.environ.get("NLA_TF32_CRITIC") == "1":
+                # Recover most of the fp32 slowdown (fp32 cuBLAS is ~6x slower
+                # than bf16 on B200): tf32 keeps fp32 range AND fp32 storage/
+                # activations/accumulation — only matmul mantissas truncate to
+                # 10 bits. The bf16 NaN came from 8-bit-mantissa activations
+                # (bf16 exponent == fp32's, so it was precision, not range);
+                # tf32 matmuls with fp32 everything-else sidesteps that.
+                # Process-global, but this worker only hosts the critic.
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                print("[NLA] NLA_TF32_CRITIC=1: tf32 matmuls enabled for the critic worker", flush=True)
         if role == "critic":
             assert args.critic_save is not None, (
                 "NLA RL requires --critic-save (reward fn reads from there)"
@@ -457,6 +484,15 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 f"_repartition_for_critic distributes actor partitions across critic "
                 f"ranks, so critic ranks >= actor_dp would get nothing. Reduce "
                 f"CRITIC_NODES/CRITIC_GPUS so critic_dp <= actor_dp."
+            )
+            assert actor_dp % critic_dp == 0, (
+                f"critic_dp={critic_dp} must EVENLY divide actor_dp={actor_dp}: "
+                f"_repartition_for_critic strides actor partitions round-robin, so "
+                f"a remainder gives some critic ranks more samples (and thus more "
+                f"microbatches) than others — the per-microbatch FSDP gradient "
+                f"collectives then mismatch across ranks and training deadlocks in "
+                f"NCCL (watchdog timeout ~10 min in). Observed with actor=4/critic=3. "
+                f"Pick critic_dp in {{1, 2, 4, ...}} dividing actor_dp."
             )
             self._nla_actor_dp = actor_dp if actor_dp != critic_dp else None
             if self._nla_actor_dp is not None:
@@ -918,6 +954,16 @@ class NLAFSDPActor(FSDPTrainRayActor):
         iter_dir = f"{self.args.save}/iter_{rollout_id + 1:07d}"
 
         if dist.get_rank() == 0:
+            # Under --no-save-optim, fsdp_utils/checkpoint.py still mkdirs
+            # optimizer/ + lr_scheduler/ but writes nothing into them. Its
+            # load() gates on .exists(), so a later resume dcp.load()s the
+            # EMPTY dir and dies with "metadata is None". rmdir only succeeds
+            # on empty dirs — real checkpoints are untouched.
+            for _sub in ("optimizer", "lr_scheduler"):
+                try:
+                    (Path(iter_dir) / _sub).rmdir()
+                except OSError:
+                    pass
             if self._is_critic_model:
                 hf_dir = f"{iter_dir}/hf"
                 self.model.save_pretrained(hf_dir, state_dict=full_sd)
