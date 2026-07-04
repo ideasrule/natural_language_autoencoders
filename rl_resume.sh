@@ -1,26 +1,39 @@
 #!/bin/bash
 # =============================================================================
-# Resume the Qwen3.6-27B NLA RL run from /workspace/old_runs/rl (rollout 160).
+# Resume the Qwen3.6-27B NLA RL run from /workspace/old_runs/rl.
 #
 # Run with NO arguments and NO edits:   bash rl_resume.sh
+# Re-runnable after a crash: everything below derives from the tracker files,
+# so it continues from whatever iteration was last saved.
 #
 # This is configs/rl.sh's train.py invocation inlined (per request, rl.sh
 # itself is untouched) with the flags changed from "initialize RL from SFT"
 # to "continue a previous RL run":
 #
-#   * --load points at the OLD RUN's actor save root (tracker -> iter 160)
-#     and --finetune is NOT passed, so miles restores weights + optimizer +
-#     lr-scheduler + rollout_id (160) + the dataset position
-#     ({load}/rollout/global_dataset_state_dict_159.pt). Training continues
-#     at rollout 160 of the ~3905-rollout epoch.
-#   * --critic-load is the old run's critic HF export (architecture/config +
-#     value_head); --critic-load-dcp overlays its DCP (weights + optimizer,
-#     tracker-resolved to iter 160).
+#   * --load points at the actor save root (tracker-resolved) and --finetune
+#     is NOT passed, so miles restores weights + optimizer + lr-scheduler +
+#     rollout_id + the dataset position ({load}/rollout/
+#     global_dataset_state_dict_*.pt). Training continues mid-epoch.
+#   * --critic-load is a clean HF export of the newest critic iter (see
+#     CRITIC SOURCE below); the critic takes fresh Adam momenta.
 #   * --ref-load (KL reference, coef 0.01) is the old run's actor-SFT HF
 #     export, staged at /workspace/old_runs/av_sft/iter_0000970/hf.
 #   * Saves go back into the SAME directories (in-place resume, per request).
 #     A background pruner keeps the 2 newest iters per role — NOTE this will
 #     eventually delete the original iter_0000160 (accepted trade-off).
+#
+# CRITIC SOURCE — two corruption-shaped constraints:
+#   * The old box's iter_0000160/hf/value_head.safetensors is CORRUPT
+#     (25215 NaN + 218 Inf of 26.2M elements — scattered, likely a bad copy;
+#     symptom: finite backbone_norm but NaN pred_norm/rewards from the very
+#     first forward). When resuming from iter 160 we therefore rebuild a
+#     clean HF export from the iter-160 DCP (the clean source of truth) via
+#     tools/convert_critic_fsdp_to_hf.py — done here automatically if
+#     critic_hf_clean/ is absent (~15 min, one-time).
+#   * Later iters' hf/ exports are written by THIS pipeline's save path and
+#     are used directly on restart.
+#   Either way a preflight gate refuses to launch on non-finite value-head
+#   weights.
 #
 # Precision: actor resumes bf16; the critic runs fp32-storage + tf32-matmul
 # (NLA_FP32_CRITIC + NLA_TF32_CRITIC). A bf16-critic resume was tried first
@@ -29,11 +42,10 @@
 # backward on THIS box produced grad_norm=nan — the same bf16 fragility the
 # from-scratch smoke hit, so it is hardware/stack-dependent, not just an
 # undertrained-critic artifact. Consequences of the fp32 switch:
-#   * the critic loads its weights from the iter-160 HF export (identical
-#     tensors to the DCP; from_pretrained upcasts bf16->fp32 cleanly) and
-#     --critic-load-dcp is NOT passed — the bf16 DCP optimizer state can't
-#     load into fp32 Adam, so the critic restarts with fresh momenta
-#     (supervised MSE; re-adapts within tens of steps).
+#   * the critic loads weights from an HF export (from_pretrained upcasts
+#     bf16->fp32 cleanly); --critic-load-dcp is NOT passed — the bf16 DCP
+#     optimizer state can't load into fp32 Adam, so the critic restarts with
+#     fresh momenta (supervised MSE; re-adapts within tens of steps).
 #   * the critic worker flips itself to sdpa (FA rejects fp32); tf32 keeps
 #     its step ~70s (validated in the smoke: grad norms match plain fp32).
 #
@@ -47,16 +59,10 @@
 # =============================================================================
 set -euo pipefail
 
+NLA_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MILES=/workspace/miles
 VENV=/venv/main
 OLD_RL=/workspace/old_runs/rl
-ACTOR_ITER="$OLD_RL/actor/iter_0000160"
-# NOT iter_0000160/hf: that export's value_head.safetensors is corrupt
-# (25215 NaN + 218 Inf of 26.2M elements — scattered, likely a bad copy;
-# symptom: finite backbone_norm but NaN pred_norm/rewards from the first
-# forward). critic_hf_clean is rebuilt from the iter-160 DCP (the clean
-# source of truth) via tools/convert_critic_fsdp_to_hf.py.
-CRITIC_ITER_HF="$OLD_RL/critic_hf_clean"
 REF_HF_CKPT=/workspace/old_runs/av_sft/iter_0000970/hf
 RL_PARQUET=/workspace/data/rl_shuf.parquet
 BASE_MODEL=Qwen/Qwen3.6-27B
@@ -76,9 +82,29 @@ mkdir -p "$NLA_EMBED_DUMP_DIR"
 
 source "$VENV/bin/activate"
 
+# --- resolve the newest saved iteration per role from the trackers ----------
+ACTOR_STEP="$(cat "$OLD_RL/actor/latest_checkpointed_iteration.txt")"
+CRITIC_STEP="$(cat "$OLD_RL/critic/latest_checkpointed_iteration.txt")"
+ACTOR_ITER="$OLD_RL/actor/$(printf 'iter_%07d' "$ACTOR_STEP")"
+CRITIC_ITER="$OLD_RL/critic/$(printf 'iter_%07d' "$CRITIC_STEP")"
+echo "[rl_resume] actor iter $ACTOR_STEP, critic iter $CRITIC_STEP"
+
+# --- critic HF source (see CRITIC SOURCE in the header) ----------------------
+if [ "$CRITIC_STEP" -eq 160 ]; then
+    CRITIC_ITER_HF="$OLD_RL/critic_hf_clean"
+    if [ ! -f "$CRITIC_ITER_HF/value_head.safetensors" ]; then
+        echo "[rl_resume] rebuilding clean critic HF from $CRITIC_ITER (~15 min, one-time)"
+        python "$NLA_REPO/tools/convert_critic_fsdp_to_hf.py" \
+            --critic-dcp "$CRITIC_ITER" \
+            --out "$CRITIC_ITER_HF" \
+            --base-model "$BASE_MODEL"
+    fi
+else
+    CRITIC_ITER_HF="$CRITIC_ITER/hf"
+fi
+
 # --- preflight: every checkpoint piece the resume depends on ----------------
-for f in "$OLD_RL/actor/latest_checkpointed_iteration.txt" \
-         "$ACTOR_ITER/nla_meta.yaml" \
+for f in "$ACTOR_ITER/nla_meta.yaml" \
          "$ACTOR_ITER/model/.metadata" \
          "$CRITIC_ITER_HF/config.json" \
          "$CRITIC_ITER_HF/value_head.safetensors" \
@@ -86,13 +112,13 @@ for f in "$OLD_RL/actor/latest_checkpointed_iteration.txt" \
          "$RL_PARQUET.nla_meta.yaml"; do
     [ -e "$f" ] || { echo "FATAL: missing $f" >&2; exit 1; }
 done
-# The corrupt-export incident above: refuse to launch on non-finite weights.
-python - <<'PY'
+# The corrupt-export incident (header): refuse to launch on non-finite weights.
+VALUE_HEAD_PATH="$CRITIC_ITER_HF/value_head.safetensors" python - <<'PY'
 from safetensors.torch import load_file
-import torch, sys
-w = load_file("/workspace/old_runs/rl/critic_hf_clean/value_head.safetensors")["weight"]
+import os, sys, torch
+w = load_file(os.environ["VALUE_HEAD_PATH"])["weight"]
 bad = torch.isnan(w).sum().item() + torch.isinf(w).sum().item()
-sys.exit(f"FATAL: value_head has {bad} non-finite elements" if bad else 0)
+sys.exit(f"FATAL: {os.environ['VALUE_HEAD_PATH']} has {bad} non-finite elements" if bad else 0)
 PY
 
 # --- background pruner: keep the 2 newest iters per role (newest may be
@@ -125,13 +151,13 @@ python train.py \
     --hf-checkpoint "$BASE_MODEL" \
     --ref-load "$REF_HF_CKPT" \
     --use-kl-loss --kl-loss-coef 0.01 \
-    `# RESUME (vs rl.sh): --load is the old RL actor root, NO --finetune ->` \
+    `# RESUME (vs rl.sh): --load is the RL actor save root, NO --finetune ->` \
     `# optimizer/lr-scheduler/rollout_id/dataset position all restore.` \
     --load "$OLD_RL/actor" \
     --nla-sidecar-source "$ACTOR_ITER" \
     --save "$OLD_RL/actor" \
     `# NO --critic-load-dcp: fp32 critic can't ingest the bf16 DCP optimizer;` \
-    `# weights come from the HF export below (same iter-160 tensors).` \
+    `# weights come from the clean HF export resolved above.` \
     --critic-load "$CRITIC_ITER_HF" \
     --critic-save "$OLD_RL/critic" \
     --critic-lr 1.41e-5 \
