@@ -91,6 +91,8 @@ ROLLOUT_GPUS=${ROLLOUT_GPUS:-4}
 # Safe for the critic: _swap_rollout_to_critic_tokens sets total_lengths to
 # critic token lengths, which is what get_data_iterator reads for packing.
 
+FINETUNE_FLAG="${FINETUNE_FLAG:---finetune}"
+
 ${PYTHON:-python} train.py \
     --train-backend "${TRAIN_BACKEND:-fsdp}" \
     --custom-actor-cls-path "${ACTOR_CLS:-nla.train_actor.NLAFSDPActor}" \
@@ -111,7 +113,7 @@ ${PYTHON:-python} train.py \
     `# the iter; the iter dir itself silently skips. --finetune = weights-only load` \
     `# (fresh rollout_id/lr; warm optimizer momenta).` \
     --load "$(dirname "${ACTOR_SFT_CKPT%/}")" \
-    --finetune \
+    $FINETUNE_FLAG \
     --nla-sidecar-source "$ACTOR_SFT_CKPT" \
     --save "$RUN_DIR/actor" \
     --critic-load "$CRITIC_SL_CKPT" \
